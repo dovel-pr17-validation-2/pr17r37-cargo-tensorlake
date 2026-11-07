@@ -1,0 +1,1411 @@
+// The fast-clone engine (`tl git clone`), backed by the private gsvc-codec packfile codec —
+// compiled only into official `--features git-clone` builds. See crates/cli/Cargo.toml and
+// crates/VENDORED_FROM.
+#[cfg(feature = "git-clone")]
+pub mod fastclone;
+
+// `tl git setup` and the git credential helper it registers, which together make plain
+// `git push`/`git pull` work against artifact-storage repos.
+pub mod setup;
+
+use std::path::PathBuf;
+
+use comfy_table::Cell;
+use console::style;
+use tensorlake::artifact_storage::ArtifactStorageClient;
+use tensorlake::artifact_storage::merge::MergeRequest;
+use tensorlake::artifact_storage::models::{
+    ListBranchesResponse, ListOperationsResponse, ListRefsResponse, ListReposResponse,
+};
+use tensorlake::artifact_storage::workspaces::WorkspaceInfo;
+use tensorlake::{ClientBuilder, Sdk};
+
+use crate::auth::context::CliContext;
+use crate::error::{CliError, Result, remote_message};
+use crate::output::table::new_table;
+
+/// Parse a human cache-size argument (`512MB`, `2GiB`, `1073741824`, ...). Lives here — not in
+/// the feature-gated fast-clone module — because the CLI argument definition needs it even in
+/// builds without the fast-clone engine.
+pub fn parse_cache_max_bytes(value: &str) -> anyhow::Result<u64> {
+    use anyhow::Context as _;
+    let raw = value.trim();
+    if raw.is_empty() {
+        anyhow::bail!("cache size cannot be empty");
+    }
+    let lower = raw.to_ascii_lowercase();
+    let suffixes = [
+        ("tib", 1024_u64.pow(4)),
+        ("tb", 1024_u64.pow(4)),
+        ("t", 1024_u64.pow(4)),
+        ("gib", 1024_u64.pow(3)),
+        ("gb", 1024_u64.pow(3)),
+        ("g", 1024_u64.pow(3)),
+        ("mib", 1024_u64.pow(2)),
+        ("mb", 1024_u64.pow(2)),
+        ("m", 1024_u64.pow(2)),
+        ("kib", 1024),
+        ("kb", 1024),
+        ("k", 1024),
+        ("b", 1),
+    ];
+    let (digits, multiplier) = suffixes
+        .iter()
+        .find_map(|(suffix, multiplier)| {
+            lower
+                .strip_suffix(suffix)
+                .map(|digits| (digits.trim(), *multiplier))
+        })
+        .unwrap_or((raw, 1));
+    let bytes = digits
+        .parse::<u64>()
+        .with_context(|| format!("invalid cache size {value:?}"))?;
+    bytes
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("cache size {value:?} is too large"))
+}
+
+pub async fn mint_token(ctx: &CliContext, repo: Option<&str>, output_json: bool) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let credential = artifact_storage_client(ctx)?
+        .mint_token_for_repo(&project_id, repo)
+        .await?
+        .into_inner();
+    if output_json {
+        println!("{}", serde_json::to_string_pretty(&credential)?);
+        return Ok(());
+    }
+
+    print_field("project", &project_id);
+    print_field("repo", &credential.repo_pattern);
+    print_field("username", &credential.git_username);
+    println!(
+        "{} {}",
+        style("password:").dim(),
+        style(&credential.token).yellow()
+    );
+    print_field("expires", &credential.expires_at);
+    print_field("scopes", &credential.scopes.join(", "));
+
+    if credential.repo_pattern != "*" {
+        let remote_url =
+            artifact_storage_client(ctx)?.git_repo_url(&project_id, &credential.repo_pattern);
+        println!();
+        println!("{}", style("Remote URL").bold().green());
+        println!("  {}", style(&remote_url).cyan());
+        println!();
+        println!(
+            "{}",
+            style("Use this credential with Git or SDK clients")
+                .bold()
+                .green()
+        );
+        println!("  {} {}", style("username:").dim(), credential.git_username);
+        println!("  {} the token above", style("password:").dim());
+    }
+    Ok(())
+}
+
+pub async fn create_repo(
+    ctx: &CliContext,
+    repo: &str,
+    default_branch: Option<&str>,
+    output_json: bool,
+) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let client = artifact_storage_client(ctx)?;
+    client
+        .create_repo(&project_id, repo, default_branch)
+        .await
+        .map_err(map_sdk_error)?;
+    let remote_url = client.git_repo_url(&project_id, repo);
+    let branch = default_branch.unwrap_or("main");
+
+    // The repo exists once create_repo returns; the credential is a convenience. A mint
+    // failure (env-token dev setups, PATs without token scope, transient errors) must not
+    // turn the command into an error — a retry would just hit "repo already exists".
+    let credential = match client.mint_token_for_repo(&project_id, Some(repo)).await {
+        Ok(credential) => Some(credential.into_inner()),
+        Err(err) => {
+            eprintln!(
+                "warning: minting a push credential failed ({err}); run `tl git token {repo}` to mint one"
+            );
+            None
+        }
+    };
+
+    if output_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "repo": repo,
+                "url": remote_url,
+                "credential": credential,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("created {remote_url}");
+    println!();
+    println!("{}", style("Push to this repo").bold().green());
+    println!("  {}", style(format!("tl git push {repo} {branch}")).cyan());
+    println!("  (mints a fresh short-lived credential automatically on every push)");
+    if let Some(credential) = credential {
+        println!();
+        println!(
+            "{}",
+            style("Credential for CI or direct HTTP access")
+                .bold()
+                .green()
+        );
+        println!("  {} {}", style("username:").dim(), credential.git_username);
+        println!(
+            "  {} {}",
+            style("password:").dim(),
+            style(&credential.token).yellow()
+        );
+        println!("  {} {}", style("expires:").dim(), credential.expires_at);
+    }
+    Ok(())
+}
+
+pub async fn list_repos(ctx: &CliContext, output_json: bool) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    // Repositories only: filesystems are `tl fs ls`'s surface. Pre-kind servers ignore the
+    // filter and keep returning everything.
+    let response = artifact_storage_client(ctx)?
+        .list_repos_of_kind(
+            &project_id,
+            Some(tensorlake::artifact_storage::models::REPO_KIND_REPOSITORY),
+        )
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner();
+    if output_json {
+        print_json(&response)?;
+        return Ok(());
+    }
+    print_repos_table(&response);
+    Ok(())
+}
+
+/// Stable public shape for `tl git workspaces`. The repo-scoped workspace endpoint is usable by
+/// ordinary repository credentials, unlike the operator fleet endpoint. Optional fields remain
+/// explicit `null` against older servers instead of being guessed from the snapshot tip.
+#[derive(serde::Serialize)]
+struct GitWorkspaceListItem {
+    id: String,
+    base: String,
+    base_ref: Option<String>,
+    head: String,
+    snapshot_count: Option<u64>,
+    last_activity_ms: Option<u64>,
+    wal_state: Option<String>,
+    attachment_state: Option<String>,
+    mounted_on: Option<String>,
+}
+
+impl From<WorkspaceInfo> for GitWorkspaceListItem {
+    fn from(workspace: WorkspaceInfo) -> Self {
+        Self {
+            id: workspace.id,
+            base: workspace.base,
+            base_ref: workspace.base_ref,
+            head: workspace.head,
+            snapshot_count: Some(workspace.snapshot_count),
+            last_activity_ms: workspace.last_activity_ms,
+            wal_state: Some(workspace.wal_state),
+            attachment_state: Some(workspace.attachment_state),
+            mounted_on: workspace.mounted_on,
+        }
+    }
+}
+
+pub async fn list_workspaces(ctx: &CliContext, repo: &str, output_json: bool) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let client = artifact_storage_client(ctx)?;
+    let credential = client
+        .git_credential_for_repo(&project_id, repo)
+        .await
+        .map_err(map_sdk_error)?;
+    let mut workspaces: Vec<GitWorkspaceListItem> = client
+        .list_workspaces(
+            &project_id,
+            repo,
+            &credential.git_username,
+            &credential.token,
+        )
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    workspaces.sort_by(|a, b| a.id.cmp(&b.id));
+
+    if output_json {
+        return print_json(&workspaces);
+    }
+    if workspaces.is_empty() {
+        println!("no workspaces found for {repo}");
+        return Ok(());
+    }
+
+    let short = |oid: &str| oid[..oid.len().min(12)].to_string();
+    let mut table = new_table(&[
+        "Workspace",
+        "Base",
+        "Head",
+        "Snapshots",
+        "WAL",
+        "Attachment",
+        "Last activity",
+    ]);
+    for workspace in &workspaces {
+        table.add_row(vec![
+            Cell::new(&workspace.id),
+            Cell::new(short(&workspace.base)),
+            Cell::new(short(&workspace.head)),
+            Cell::new(
+                workspace
+                    .snapshot_count
+                    .map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+            ),
+            Cell::new(workspace.wal_state.as_deref().unwrap_or("unknown")),
+            Cell::new(
+                workspace
+                    .mounted_on
+                    .as_deref()
+                    .or(workspace.attachment_state.as_deref())
+                    .unwrap_or("unknown"),
+            ),
+            Cell::new(
+                workspace
+                    .last_activity_ms
+                    .map_or_else(|| "unknown".to_string(), |time| time.to_string()),
+            ),
+        ]);
+    }
+    println!("{table}");
+    println!("{} workspaces", workspaces.len());
+    Ok(())
+}
+
+pub async fn delete_repo(ctx: &CliContext, repo: &str) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    artifact_storage_client(ctx)?
+        .delete_repo(&project_id, repo)
+        .await
+        .map_err(map_sdk_error)?;
+    println!("deleted {repo}");
+    Ok(())
+}
+
+pub async fn fork_repo(ctx: &CliContext, repo: &str, base_repo: &str) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let client = artifact_storage_client(ctx)?;
+    client
+        .fork_repo(&project_id, repo, base_repo)
+        .await
+        .map_err(map_sdk_error)?;
+    println!(
+        "forked {} from {}",
+        client.git_repo_url(&project_id, repo),
+        base_repo
+    );
+    Ok(())
+}
+
+pub async fn archive_repo(ctx: &CliContext, repo: &str) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    artifact_storage_client(ctx)?
+        .archive_repo(&project_id, repo)
+        .await
+        .map_err(map_sdk_error)?;
+    println!("archived {repo}");
+    Ok(())
+}
+
+pub async fn restore_repo(ctx: &CliContext, repo: &str) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    artifact_storage_client(ctx)?
+        .restore_repo(&project_id, repo)
+        .await
+        .map_err(map_sdk_error)?;
+    println!("restored {repo}");
+    Ok(())
+}
+
+/// Accept either a bare repo name or a full clone URL (as printed by `tl git url`), matching how
+/// `git clone` itself treats its argument. A URL's last non-empty path segment (with any `.git`
+/// suffix stripped) is used as the repo name.
+#[cfg(any(feature = "git-clone", test))]
+fn normalize_repo_arg(repo: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(repo) else {
+        return repo.to_string();
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return repo.to_string();
+    }
+    url.path_segments()
+        .into_iter()
+        .flatten()
+        .rfind(|s| !s.is_empty())
+        .map(|s| s.strip_suffix(".git").unwrap_or(s).to_string())
+        .unwrap_or_else(|| repo.to_string())
+}
+
+/// Fast clone without the engine: this build was made from the public source tree, which
+/// carries only a resolution placeholder for the private gsvc-codec. Point the user at the
+/// official binary instead of failing cryptically.
+#[cfg(not(feature = "git-clone"))]
+pub async fn clone_repo(
+    _ctx: &CliContext,
+    _repo: &str,
+    _dest: Option<PathBuf>,
+    _cache_dir: Option<PathBuf>,
+    _cache_max_bytes: Option<u64>,
+    _no_checkout: bool,
+) -> Result<()> {
+    Err(CliError::Other(anyhow::anyhow!(
+        "this build of `tl` lacks the fast-clone engine (built without the `git-clone` \
+         feature). Install the official release binary, or build with `just build-cli-full` \
+         from a checkout with artifact_storage access."
+    )))
+}
+
+#[cfg(feature = "git-clone")]
+fn new_fastclone_spinner(message: &str) -> Option<indicatif::ProgressBar> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return None;
+    }
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .template("{spinner} {msg}")
+            .unwrap(),
+    );
+    pb.set_message(message.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    Some(pb)
+}
+
+#[cfg(feature = "git-clone")]
+fn fastclone_byte_progress_style() -> indicatif::ProgressStyle {
+    indicatif::ProgressStyle::with_template(
+        "{spinner} {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta}) {msg}",
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "git-clone")]
+fn fastclone_progress(
+    spinner: Option<indicatif::ProgressBar>,
+) -> Option<fastclone::FastCloneProgress> {
+    let pb = spinner?;
+    Some(std::sync::Arc::new(move |ev| {
+        use self::fastclone::FastCloneEvent;
+        match ev {
+            FastCloneEvent::FetchingManifest => pb.set_message("fetching clone manifest"),
+            FastCloneEvent::DownloadPlan { bytes } => {
+                pb.set_style(fastclone_byte_progress_style());
+                pb.set_length(bytes);
+                pb.set_position(0);
+                pb.set_message("fetching pack artifacts");
+            }
+            FastCloneEvent::DownloadedBytes { bytes } => pb.inc(bytes),
+            FastCloneEvent::InstallingObjects { dest } => {
+                pb.finish_and_clear();
+                eprintln!("installing objects into {}", dest.display());
+            }
+        }
+    }))
+}
+
+#[cfg(feature = "git-clone")]
+pub async fn clone_repo(
+    ctx: &CliContext,
+    repo: &str,
+    dest: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
+    cache_max_bytes: Option<u64>,
+    no_checkout: bool,
+) -> Result<()> {
+    let repo = &normalize_repo_arg(repo);
+    let project_id = project_id(ctx)?;
+    let client = artifact_storage_client(ctx)?;
+    let repo_url = client.git_repo_url(&project_id, repo);
+
+    let spinner = new_fastclone_spinner(&format!("minting git credential for {repo}"));
+    let credential = client
+        .git_credential_for_repo(&project_id, repo)
+        .await
+        .map_err(map_sdk_error)?;
+    if let Some(pb) = &spinner {
+        pb.set_message("fetching clone manifest");
+    }
+
+    let dest = dest.unwrap_or_else(|| fastclone::default_dest_from_url(&repo_url));
+    let progress = fastclone_progress(spinner.clone());
+    let opts = fastclone::FastCloneOptions {
+        repo_url: repo_url.clone(),
+        dest: dest.clone(),
+        cache_dir,
+        cache_max_bytes,
+        credential: Some(fastclone::BasicAuth {
+            username: credential.git_username,
+            password: Some(credential.token),
+        }),
+        checkout: !no_checkout,
+        progress,
+    };
+    let stats = fastclone::fast_clone(opts).await?;
+    if let Some(pb) = spinner {
+        pb.finish_and_clear();
+    }
+    // Register the credential helper in the new checkout's local config (same wiring as
+    // `tl git setup`) so plain `git fetch`/`git push` there authenticate automatically once the
+    // clone-time token expires. The clone itself succeeded; a config failure only warrants a
+    // warning.
+    if let Err(err) = setup::configure_credential_helper(ctx, &dest, client.git_base_url()) {
+        eprintln!("warning: could not register the git credential helper: {err}");
+    }
+    println!(
+        "{}",
+        fastclone::format_fast_clone_stats(&format!("cloned {repo}"), &stats)
+    );
+    Ok(())
+}
+
+pub async fn list_branches(ctx: &CliContext, repo: &str, output_json: bool) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let response = artifact_storage_client(ctx)?
+        .list_branches(&project_id, repo)
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner();
+    if output_json {
+        print_json(&response)?;
+        return Ok(());
+    }
+    print_branches_table(&response);
+    Ok(())
+}
+
+pub async fn delete_branch(ctx: &CliContext, repo: &str, branch: &str) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    artifact_storage_client(ctx)?
+        .delete_branch(&project_id, repo, branch)
+        .await
+        .map_err(map_sdk_error)?;
+    println!("deleted branch {branch} from {repo}");
+    Ok(())
+}
+
+pub async fn list_refs(ctx: &CliContext, repo: &str, output_json: bool) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let response = artifact_storage_client(ctx)?
+        .list_refs(&project_id, repo)
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner();
+    if output_json {
+        print_json(&response)?;
+        return Ok(());
+    }
+    print_refs_table(&response);
+    Ok(())
+}
+
+pub async fn status(ctx: &CliContext, repo: &str, output_json: bool) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let client = artifact_storage_client(ctx)?;
+    let info = client
+        .repo_info(&project_id, repo)
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner();
+
+    if output_json {
+        println!("{}", serde_json::to_string_pretty(&info)?);
+        return Ok(());
+    }
+
+    println!("repo: {}", info.repo);
+    println!("url: {}", info.url);
+    println!("branches: {}", info.branches.len());
+    if info.branches.is_empty() {
+        println!("no branches found");
+    } else {
+        print_branches_table(&ListBranchesResponse {
+            repo: info.repo.clone(),
+            branches: info.branches.clone(),
+        });
+    }
+    println!("refs: {}", info.refs.len());
+    Ok(())
+}
+
+pub async fn list_operations(
+    ctx: &CliContext,
+    repo: &str,
+    git_username: &str,
+    git_token: &str,
+    output_json: bool,
+) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let response = artifact_storage_client(ctx)?
+        .list_operations_with_credential(&project_id, repo, git_username, git_token)
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner();
+    if output_json {
+        print_json(&response)?;
+        return Ok(());
+    }
+    print_operations_table(&response);
+    Ok(())
+}
+
+/// Server-side three-way merge of `theirs` into `ours` (gsvc merge design §9.3). Preflight
+/// never writes; commit mode CAS-advances the `ours` branch. A `fail`-policy conflict prints
+/// the report and exits non-zero — nothing was published.
+#[allow(clippy::too_many_arguments)]
+pub async fn merge(
+    ctx: &CliContext,
+    repo: &str,
+    ours: &str,
+    theirs: &str,
+    preflight: bool,
+    deep: bool,
+    materialize: bool,
+    message: Option<&str>,
+    base: Option<&str>,
+    output_json: bool,
+) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let client = artifact_storage_client(ctx)?;
+    let cred = client
+        .mint_token_for_repo(&project_id, Some(repo))
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner();
+    let request = MergeRequest {
+        ours: ours.to_string(),
+        theirs: theirs.to_string(),
+        base: base.map(str::to_string),
+        deep,
+        mode: (!preflight).then(|| "commit".to_string()),
+        policy: materialize.then(|| "materialize".to_string()),
+        message: message.map(str::to_string),
+        ..Default::default()
+    };
+    let report = client
+        .repo_merge(&project_id, repo, &cred.git_username, &cred.token, &request)
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner();
+    if output_json {
+        print_json(&report)?;
+        // A fail-policy conflict published nothing; the exit code says so even in JSON mode.
+        if !preflight && report.commit.is_none() && !report.clean {
+            return Err(CliError::usage("merge conflicts; nothing was published"));
+        }
+        return Ok(());
+    }
+    let short = |oid: &str| oid[..oid.len().min(12)].to_string();
+    if let Some(b) = &report.merge_base {
+        print_field("merge base", &short(b));
+    } else {
+        print_field("merge base", "none (unrelated histories)");
+    }
+    print_field("changed paths", &report.changed_paths.to_string());
+    if !report.conflicts.is_empty() {
+        println!(
+            "{} {} conflict(s):",
+            style("conflicts:").dim(),
+            report.conflicts.len()
+        );
+        for c in &report.conflicts {
+            println!(
+                "  {:<14} {}{}",
+                style(&c.kind).yellow(),
+                c.path,
+                if c.potential { " (potential)" } else { "" },
+            );
+        }
+        if report.conflicts.iter().any(|c| c.potential) {
+            println!("  (run with --deep for exact content-merge answers)");
+        }
+    }
+    if preflight {
+        if report.already_merged {
+            println!("{theirs} is already merged into {ours}; a merge would change nothing.");
+        } else if report.clean {
+            println!(
+                "Clean merge{}.",
+                if report.fast_forward {
+                    " (fast-forward)"
+                } else {
+                    ""
+                }
+            );
+        }
+        return Ok(());
+    }
+    match report.commit {
+        Some(commit) => {
+            println!(
+                "Merged {theirs} into {ours} at {}{}",
+                short(&commit),
+                if report.fast_forwarded {
+                    " (fast-forward)"
+                } else if !report.clean {
+                    " (conflicts materialized as diff3 markers)"
+                } else {
+                    ""
+                },
+            );
+            Ok(())
+        }
+        None if report.already_merged => {
+            println!("{theirs} is already merged into {ours}; nothing to do.");
+            Ok(())
+        }
+        None => Err(CliError::usage(format!(
+            "merge conflicts; nothing was published. Rerun with --materialize to land the conflicts as diff3 markers, or resolve on a workspace forked from {ours}.",
+        ))),
+    }
+}
+
+/// The structured conflict record of a materialize-policy merge commit.
+pub async fn commit_conflicts(
+    ctx: &CliContext,
+    repo: &str,
+    commit: &str,
+    output_json: bool,
+) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let client = artifact_storage_client(ctx)?;
+    let cred = client
+        .mint_token_for_repo(&project_id, Some(repo))
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner();
+    let record = client
+        .commit_conflicts(&project_id, repo, &cred.git_username, &cred.token, commit)
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner();
+    let Some(record) = record else {
+        println!("no conflict record: {commit} merged cleanly (or is unknown here)");
+        return Ok(());
+    };
+    if output_json {
+        return print_json(&record);
+    }
+    let short = |oid: &str| oid[..oid.len().min(12)].to_string();
+    print_field("ours", &short(&record.ours_commit));
+    print_field("theirs", &short(&record.theirs_commit));
+    if let Some(base) = &record.base_commit {
+        print_field("base", &short(base));
+    }
+    println!(
+        "{} {} path(s):",
+        style("conflicts:").dim(),
+        record.paths.len()
+    );
+    for p in &record.paths {
+        println!("  {:<14} {}", style(&p.kind).yellow(), p.path);
+    }
+    if record.truncated_paths > 0 {
+        println!(
+            "  … and {} more (record truncated; the commit's marker content is complete)",
+            record.truncated_paths
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn artifact_storage_client(ctx: &CliContext) -> Result<ArtifactStorageClient> {
+    // Sandbox attach path: no platform credential in the guest. Every data-plane call
+    // authenticates per request with the git credential; the bearer only backs the token-mint
+    // path, which the TENSORLAKE_GIT_TOKEN branch never reaches — so the git token stands in.
+    let token = match ctx.bearer_token() {
+        Ok(t) => t,
+        Err(e) => std::env::var("TENSORLAKE_GIT_TOKEN").map_err(|_| e)?,
+    };
+    let mut builder = ClientBuilder::new(&ctx.api_url).bearer_token(&token);
+    let use_scope_headers = ctx.personal_access_token.is_some() && ctx.api_key.is_none();
+    if use_scope_headers
+        && let (Some(organization_id), Some(project_id)) =
+            (ctx.effective_organization_id(), ctx.effective_project_id())
+    {
+        builder = builder.scope(&organization_id, &project_id);
+    }
+    let sdk = Sdk::with_client_builder(builder)?;
+    sdk.artifact_storage().map_err(Into::into)
+}
+
+pub(crate) fn project_id(ctx: &CliContext) -> Result<String> {
+    ctx.effective_project_id()
+        .ok_or_else(|| CliError::auth("missing project ID; run `tl init`"))
+}
+
+fn print_field(label: &str, value: &str) {
+    println!("{} {}", style(format!("{label}:")).dim(), value);
+}
+
+fn print_repos_table(response: &ListReposResponse) {
+    if response.repos.is_empty() {
+        println!("no repos found");
+        return;
+    }
+    let mut table = new_table(&["Name", "Default Branch", "Status"]);
+    for repo in &response.repos {
+        table.add_row(vec![
+            Cell::new(&repo.name),
+            Cell::new(&repo.default_branch),
+            Cell::new(&repo.status),
+        ]);
+    }
+    println!("{table}");
+    println!("{} repos", response.repos.len());
+}
+
+fn print_branches_table(response: &ListBranchesResponse) {
+    if response.branches.is_empty() {
+        println!("no branches found");
+        return;
+    }
+    let mut table = new_table(&["Branch", "OID"]);
+    for branch in &response.branches {
+        table.add_row(vec![Cell::new(&branch.name), Cell::new(&branch.oid)]);
+    }
+    println!("{table}");
+}
+
+fn print_refs_table(response: &ListRefsResponse) {
+    if response.refs.is_empty() {
+        println!("no refs found");
+        return;
+    }
+    let mut table = new_table(&["Ref", "OID"]);
+    for git_ref in &response.refs {
+        table.add_row(vec![Cell::new(&git_ref.name), Cell::new(&git_ref.oid)]);
+    }
+    println!("{table}");
+}
+
+fn print_operations_table(response: &ListOperationsResponse) {
+    if response.operations.is_empty() {
+        println!("no operations found");
+        return;
+    }
+    let mut table = new_table(&["Op ID", "Kind", "Actor", "Refs", "Time"]);
+    for op in &response.operations {
+        table.add_row(vec![
+            Cell::new(&op.op_id),
+            Cell::new(&op.kind),
+            Cell::new(&op.actor),
+            Cell::new(op.refs.len()),
+            Cell::new(op.at_secs),
+        ]);
+    }
+    println!("{table}");
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+pub(crate) fn map_sdk_error(error: tensorlake::error::SdkError) -> CliError {
+    match error {
+        tensorlake::error::SdkError::Authentication(_) => {
+            CliError::auth("authentication failed. set TENSORLAKE_API_KEY or run 'tl login'.")
+        }
+        tensorlake::error::SdkError::Authorization(_) => CliError::auth(
+            "permission denied. set TENSORLAKE_API_KEY with required permissions, or run 'tl init'.",
+        ),
+        tensorlake::error::SdkError::ServerError { status, message } => {
+            if matches!(
+                status,
+                reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND
+            ) {
+                CliError::usage(remote_message(&message))
+            } else {
+                CliError::from(tensorlake::error::SdkError::ServerError { status, message })
+            }
+        }
+        other => CliError::from(other),
+    }
+}
+
+/// `tl git push` — resumable chunked push of the current Git worktree as one commit.
+/// Retrying after any failure is safe and cheap: the client re-negotiates and uploads only what
+/// the server still lacks.
+/// The history push (artifact_storage #279): send the local branch's REAL commits — same
+/// SHAs a `git push` would publish — through the resumable upload surface. Negotiation is
+/// git-native: the server's advertised tips that exist locally become `^have` exclusions, the
+/// local git builds the pack, and the server's ordinary receive-pack finalizes it.
+#[allow(clippy::too_many_arguments)]
+async fn push_history(
+    client: &ArtifactStorageClient,
+    project_id: &str,
+    repo: &str,
+    branch: &str,
+    root: &std::path::Path,
+    credential: &tensorlake::artifact_storage::models::GitCredential,
+    expect_oid: Option<String>,
+    output_json: bool,
+) -> Result<()> {
+    use tensorlake::artifact_storage::history_push::{GitPushProgress, GitPushRefUpdate};
+
+    let ref_name = format!("refs/heads/{branch}");
+    let tip = run_git(
+        root,
+        &["rev-parse", "--verify", &format!("{ref_name}^{{commit}}")],
+    )
+    .map_err(|_| {
+        CliError::usage(format!(
+            "local branch '{branch}' not found — a history push sends your local \
+                 branch's commits. Use --snapshot to push the worktree as one commit instead."
+        ))
+    })?;
+
+    let refs = client
+        .list_refs_with_credential(
+            project_id,
+            repo,
+            &credential.git_username,
+            &credential.token,
+        )
+        .await
+        .map_err(map_sdk_error)?
+        .into_inner()
+        .refs;
+    let server_tip = refs
+        .iter()
+        .find(|r| r.name == ref_name)
+        .map(|r| r.oid.clone());
+    if server_tip.as_deref() == Some(tip.as_str()) {
+        println!(
+            "{} {ref_name} is already {tip}",
+            style("up-to-date").green()
+        );
+        return Ok(());
+    }
+    // git's own push rule: refuse a non-fast-forward unless the user states intent.
+    // --expect-oid is that statement (force-with-lease). Without it, a server tip we have
+    // locally must be an ancestor of what we're pushing; one we DON'T have locally means our
+    // view is stale in a way we can't verify — fetch first, or force with the lease.
+    if expect_oid.is_none()
+        && let Some(server_tip) = server_tip.as_deref()
+    {
+        let have_server_tip = run_git(
+            root,
+            &["cat-file", "-e", &format!("{server_tip}^{{commit}}")],
+        )
+        .is_ok();
+        if !have_server_tip {
+            return Err(CliError::usage(format!(
+                "the server's {ref_name} ({server_tip}) is not in your local repo. Either your view \
+                 is stale (`git fetch` the repo, then rebase or merge) or the server branch \
+                 has unrelated history — e.g. it was seeded by a snapshot push — in which \
+                 case fetching cannot help and pushing means REPLACING it. Force-with-lease \
+                 via --expect-oid {server_tip} states that intent."
+            )));
+        }
+        if run_git(root, &["merge-base", "--is-ancestor", server_tip, &tip]).is_err() {
+            return Err(CliError::usage(format!(
+                "non-fast-forward: the server's {ref_name} ({server_tip}) is not an ancestor of \
+                 your {branch} ({tip}). Rebase or merge first, or force-with-lease via \
+                 --expect-oid {server_tip}."
+            )));
+        }
+    }
+    // Force-with-lease wins over the advertised tip; otherwise CAS on what the server showed.
+    let old_oid = expect_oid.or(server_tip);
+
+    // Every advertised tip we HAVE locally excludes its closure from the pack — the same
+    // pruning `git push` negotiates. Tips we don't have prune nothing (and must not be
+    // passed to rev-list, which would error on the unknown object).
+    let mut haves = Vec::new();
+    for r in &refs {
+        if haves.len() >= 256 {
+            break;
+        }
+        if run_git(root, &["cat-file", "-e", &format!("{}^{{commit}}", r.oid)]).is_ok() {
+            haves.push(r.oid.clone());
+        }
+    }
+
+    let bar = indicatif::ProgressBar::new_spinner();
+    bar.enable_steady_tick(std::time::Duration::from_millis(120));
+    bar.set_message("packing objects...");
+
+    // git owns pack generation: `--revs` reads `<tip>` + `^<have>` lines, `--delta-base-offset`
+    // matches what a push client negotiates (self-contained OFS deltas, no thin bases).
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "pack-objects",
+            "--revs",
+            "--delta-base-offset",
+            "-q",
+            "--stdout",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| CliError::usage(format!("spawning git pack-objects: {e}")))?;
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let mut revs = format!("{tip}\n");
+        for have in &haves {
+            revs.push('^');
+            revs.push_str(have);
+            revs.push('\n');
+        }
+        stdin
+            .write_all(revs.as_bytes())
+            .map_err(|e| CliError::usage(format!("writing revs to pack-objects: {e}")))?;
+    }
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    let progress_bar = bar.clone();
+    let report = client
+        .push_git_pack(
+            project_id,
+            repo,
+            &credential.git_username,
+            &credential.token,
+            stdout,
+            vec![GitPushRefUpdate {
+                name: ref_name.clone(),
+                old_oid,
+                new_oid: tip.clone(),
+            }],
+            Some(Box::new(move |p| match p {
+                GitPushProgress::PartUploaded { parts, bytes } => {
+                    progress_bar.set_message(format!(
+                        "uploaded {parts} part(s), {:.1} MiB",
+                        bytes as f64 / (1024.0 * 1024.0)
+                    ))
+                }
+                GitPushProgress::Finalizing { phase } => {
+                    progress_bar.set_message(format!("server finalize: {phase}"))
+                }
+            })),
+        )
+        .await;
+    bar.finish_and_clear();
+    let report = match report {
+        Ok(report) => {
+            // Success drained stdout to EOF, so the child has exited; a nonzero status here
+            // means pack-objects itself failed while producing what we uploaded — fail loud.
+            let pack_status = child
+                .wait()
+                .map_err(|e| CliError::usage(format!("waiting for pack-objects: {e}")))?;
+            if !pack_status.success() {
+                return Err(CliError::usage(
+                    "git pack-objects failed while producing the pack (bad local objects?)"
+                        .to_string(),
+                ));
+            }
+            report
+        }
+        Err(e) => {
+            // The upload failed mid-stream: the child is likely blocked writing into a pipe
+            // nobody reads (or already died of EPIPE when the reader dropped). Kill it and
+            // surface the UPLOAD error — the child's exit status is downstream noise.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(map_sdk_error(e));
+        }
+    };
+
+    if output_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "unpack_ok": report.unpack_ok,
+                "refs": report
+                    .refs
+                    .iter()
+                    .map(|r| serde_json::json!({"name": r.name, "error": r.error}))
+                    .collect::<Vec<_>>(),
+                "tip": tip,
+            })
+        );
+    } else {
+        for r in &report.refs {
+            match &r.error {
+                None => println!(
+                    "{} {} -> {}",
+                    style("pushed").green().bold(),
+                    style(&r.name).cyan(),
+                    &tip[..12.min(tip.len())]
+                ),
+                Some(err) => println!(
+                    "{} {}: {err}",
+                    style("rejected").red().bold(),
+                    style(&r.name).cyan()
+                ),
+            }
+        }
+    }
+    if !report.unpack_ok || report.refs.iter().any(|r| r.error.is_some()) {
+        return Err(CliError::usage("push did not fully apply".to_string()));
+    }
+    Ok(())
+}
+
+/// Run one git command in `dir`, returning trimmed stdout; a non-zero exit is an error
+/// carrying stderr. History pushes shell out to the local git for exactly what git is
+/// authoritative about: ref resolution, object presence, and pack generation.
+fn run_git(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| CliError::usage(format!("running git: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::usage(format!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn push(
+    ctx: &CliContext,
+    repo: &str,
+    branch: &str,
+    message: Option<&str>,
+    expect_oid: Option<String>,
+    create: bool,
+    snapshot: bool,
+    output_json: bool,
+) -> Result<()> {
+    use tensorlake::artifact_storage::ingest::PushOptions;
+
+    if !snapshot && message.is_some() {
+        return Err(CliError::usage(
+            "-m/--message names the snapshot commit; history pushes send your existing \
+             commits unchanged. Pass --snapshot to push the worktree as one commit, or drop -m.",
+        ));
+    }
+    let root = current_git_worktree_root("tl git push")?;
+    let project_id = project_id(ctx)?;
+    let client = artifact_storage_client(ctx)?;
+    let credential = client
+        .git_credential_for_repo(&project_id, repo)
+        .await
+        .map_err(map_sdk_error)?;
+
+    // The server creates repos lazily on ingest, which turns an argument mixup into data
+    // silently landing in a phantom repo (`tl git push main` created and pushed to a repo
+    // named "main" in prod, 2026-08-27 — tensorlakeai/tensorlake#931). Gate on existence:
+    // pushing to a missing repo is an error unless --create says otherwise.
+    let exists = match client
+        .repo_meta_with_credential(
+            &project_id,
+            repo,
+            &credential.git_username,
+            &credential.token,
+        )
+        .await
+    {
+        Ok(_) => true,
+        Err(tensorlake::error::SdkError::ServerError { status, .. })
+            if status == reqwest::StatusCode::NOT_FOUND =>
+        {
+            false
+        }
+        Err(err) => return Err(map_sdk_error(err)),
+    };
+    if !exists {
+        if !create {
+            return Err(CliError::usage(format!(
+                "repo '{repo}' does not exist in this project.\n\
+                 note: the first argument of `tl git push` is the REPO, not the branch \
+                 (`tl git push <repo> <branch>`).\n\
+                 To create '{repo}' and push in one step, re-run with --create, or create it \
+                 first with `tl git repo create {repo}`."
+            )));
+        }
+        client
+            .create_repo(&project_id, repo, Some(branch))
+            .await
+            .map_err(map_sdk_error)?;
+        println!(
+            "{} repo {} (did not exist)",
+            console::style("created").yellow().bold(),
+            console::style(repo).cyan()
+        );
+    }
+
+    if !snapshot {
+        return push_history(
+            &client,
+            &project_id,
+            repo,
+            branch,
+            &root,
+            &credential,
+            expect_oid,
+            output_json,
+        )
+        .await;
+    }
+
+    let bar = indicatif::ProgressBar::new_spinner();
+    bar.enable_steady_tick(std::time::Duration::from_millis(120));
+    bar.set_message("hashing worktree files...");
+    let opts = PushOptions {
+        branch: branch.to_string(),
+        message: message.unwrap_or("tl push").to_string(),
+        base: None,
+        expect_oid,
+        progress: Some(super::push_progress_spinner(&bar)),
+        ..Default::default()
+    };
+    let report = client
+        .push_worktree(
+            &project_id,
+            repo,
+            &credential.git_username,
+            &credential.token,
+            &root,
+            opts,
+        )
+        .await?
+        .into_inner();
+    bar.finish_and_clear();
+
+    if output_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "commit": report.commit,
+                "tree": report.tree,
+                "ref": report.ref_name,
+                "created": report.created,
+                "files": report.files,
+                "bytes_total": report.bytes_total,
+                "chunks_total": report.chunks_total,
+                "chunks_uploaded": report.chunks_uploaded,
+                "bytes_uploaded": report.bytes_uploaded,
+            })
+        );
+    } else {
+        // `chunks_total` counts distinct chunks push-wide, but a chunk shared by several
+        // tokened full-stream files uploads once per file, so uploads can still exceed it;
+        // saturate instead of panicking on the subtraction.
+        let deduped = report.chunks_total.saturating_sub(report.chunks_uploaded);
+        println!(
+            "{} {} -> {} ({} files, {} of {} chunks uploaded, {} deduplicated, {} bytes on the wire)",
+            console::style("pushed").green().bold(),
+            report.commit,
+            report.ref_name,
+            report.files,
+            report.chunks_uploaded,
+            report.chunks_total,
+            deduped,
+            report.bytes_uploaded,
+        );
+    }
+    Ok(())
+}
+
+fn current_git_worktree_root(command: &str) -> Result<std::path::PathBuf> {
+    git_worktree_root_from(&std::env::current_dir()?, command)
+}
+
+fn git_worktree_root_from(cwd: &std::path::Path, command: &str) -> Result<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .map_err(|err| {
+            CliError::usage(format!(
+                "{command} requires Git to locate the current worktree: {err}"
+            ))
+        })?;
+
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let suffix = if detail.is_empty() {
+            "not a Git repository".to_string()
+        } else {
+            detail
+        };
+        return Err(CliError::usage(format!(
+            "{command} must be run inside a Git worktree ({suffix})"
+        )));
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        return Err(CliError::usage(
+            "git rev-parse returned an empty worktree root".to_string(),
+        ));
+    }
+
+    Ok(std::path::PathBuf::from(root))
+}
+
+/// `tl git commit-status <repo> <job-id>` — the out-of-band view of a detached commit
+/// job's state machine, from any terminal or process.
+pub async fn commit_status(ctx: &CliContext, repo: &str, job_id: &str) -> Result<()> {
+    let project_id = project_id(ctx)?;
+    let client = artifact_storage_client(ctx)?;
+    let credential = client
+        .git_credential_for_repo(&project_id, repo)
+        .await
+        .map_err(map_sdk_error)?;
+    let job = client
+        .commit_job_status(
+            &project_id,
+            repo,
+            &credential.git_username,
+            &credential.token,
+            job_id,
+        )
+        .await?
+        .into_inner();
+    let state = job.state.as_str();
+    match state {
+        "committed" => println!(
+            "{} {} -> {}",
+            console::style("committed").green().bold(),
+            job.commit.as_deref().unwrap_or("?"),
+            job.ref_name.as_deref().unwrap_or("?"),
+        ),
+        "failed" => println!(
+            "{} {} ({}){}",
+            console::style("failed").red().bold(),
+            job.error
+                .as_ref()
+                .map(|err| err.message.as_str())
+                .unwrap_or("?"),
+            job.error
+                .as_ref()
+                .map(|err| err.kind.as_str())
+                .unwrap_or("?"),
+            if job.error.as_ref().map(|err| err.retryable).unwrap_or(false) {
+                " — safe to re-push: uploaded chunks are deduplicated"
+            } else {
+                ""
+            },
+        ),
+        _ => {
+            let phase = job.phase.as_deref().unwrap_or(state);
+            if let Some(read_back) = job.read_back {
+                let done = read_back.done;
+                let total = read_back.total;
+                let pct = done.saturating_mul(100).checked_div(total).unwrap_or(0);
+                println!(
+                    "{} {phase}: {done}/{total} chunks ({pct}%)",
+                    console::style(state).yellow().bold(),
+                );
+            } else {
+                println!("{} {phase}", console::style(state).yellow().bold());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_list_json_renders_server_wal_and_attachment_facts() {
+        let workspace: WorkspaceInfo = serde_json::from_value(serde_json::json!({
+            "id": "ws-1",
+            "ref_name": "refs/workspaces/ws-1",
+            "principal": "agent-1",
+            "base": "a".repeat(40),
+            "base_ref": "refs/heads/main",
+            "head": "b".repeat(40),
+            "created_at_secs": 10,
+            "lease_secs": 0,
+            "lease_due_ms": null,
+            "pinned": true,
+            "shared_target": null,
+            "snapshot_count": 2,
+            "last_activity_ms": 99,
+            "wal_state": "dirty",
+            "attachment_state": "attached",
+            "mounted_on": "sandbox-1",
+            "wal_generation": 7
+        }))
+        .unwrap();
+        let row = GitWorkspaceListItem::from(workspace);
+        let json = serde_json::to_value(row).unwrap();
+        assert_eq!(json["id"], "ws-1");
+        assert_eq!(json["snapshot_count"], 2);
+        assert_eq!(json["last_activity_ms"], 99);
+        assert_eq!(json["wal_state"], "dirty");
+        assert_eq!(json["attachment_state"], "attached");
+        assert_eq!(json["mounted_on"], "sandbox-1");
+    }
+
+    #[test]
+    fn git_worktree_root_rejects_non_git_dir() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = git_worktree_root_from(dir.path(), "tl git push")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tl git push must be run inside a Git worktree"));
+    }
+
+    #[test]
+    fn normalize_repo_arg_passes_through_bare_names() {
+        assert_eq!(normalize_repo_arg("linux1"), "linux1");
+    }
+
+    #[test]
+    fn normalize_repo_arg_extracts_repo_from_full_url() {
+        assert_eq!(
+            normalize_repo_arg("https://git.tensorlake.ai/project_abc/linux1"),
+            "linux1"
+        );
+        assert_eq!(
+            normalize_repo_arg("https://git.tensorlake.ai/project_abc/linux1.git"),
+            "linux1"
+        );
+        assert_eq!(
+            normalize_repo_arg("http://localhost:8080/demo/myrepo/"),
+            "myrepo"
+        );
+    }
+
+    #[test]
+    fn normalize_repo_arg_ignores_non_http_schemes() {
+        assert_eq!(
+            normalize_repo_arg("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git"
+        );
+    }
+}

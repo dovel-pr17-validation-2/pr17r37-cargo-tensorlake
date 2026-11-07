@@ -1,0 +1,1015 @@
+// --- Enums ---
+
+export enum SandboxStatus {
+  PENDING = "pending",
+  RUNNING = "running",
+  SNAPSHOTTING = "snapshotting",
+  SUSPENDING = "suspending",
+  SUSPENDED = "suspended",
+  TERMINATED = "terminated",
+  TIMEOUT = "timeout",
+  /** Terminal status used by blocking create/claim responses. */
+  FAILED = "failed",
+}
+
+/**
+ * Why a pending sandbox is waiting (`pendingReason`). The wire value is a
+ * snake_case string; unknown future reasons arrive as plain strings.
+ */
+export enum SandboxPendingReason {
+  SCHEDULING = "scheduling",
+  WAITING_FOR_CONTAINER = "waiting_for_container",
+  NO_EXECUTORS_AVAILABLE = "no_executors_available",
+  NO_RESOURCES_AVAILABLE = "no_resources_available",
+  POOL_AT_CAPACITY = "pool_at_capacity",
+  MAX_CAPACITY_REACHED = "max_capacity_reached",
+  NO_EXECUTOR_FOR_SNAPSHOT_LOCATION = "no_executor_for_snapshot_location",
+  /** The autoscaler reported that no fleet can ever place this shape. */
+  UNPLACEABLE = "unplaceable",
+}
+
+/** `terminationReason` when a `maxPendingSecs` bound expired, or the shape is unplaceable. */
+export const TERMINATION_REASON_NO_CAPACITY = "no_capacity";
+/** `terminationReason` when a pending sandbox was deleted before it ran. */
+export const TERMINATION_REASON_CANCELLED = "cancelled";
+
+/** Whether a sandbox status is one a readiness wait keeps polling through. */
+export function isSandboxPending(status: SandboxStatus | string): boolean {
+  return String(status) === SandboxStatus.PENDING;
+}
+
+export enum SnapshotStatus {
+  IN_PROGRESS = "in_progress",
+  LOCAL_READY = "local_ready",
+  COMPLETED = "completed",
+  FAILED = "failed",
+  DELETING = "deleting",
+  REPLICATING = "replicating",
+  UNKNOWN = "unknown",
+}
+
+/**
+ * Snapshot type for sandbox snapshot creation.
+ *
+ * - `"memory"`: Capture VM memory + filesystem state. Sandboxes restored
+ *   from this snapshot warm-restore VM memory.
+ * - `"filesystem"`: Capture filesystem state only. Sandboxes restored from
+ *   this snapshot cold-boot from the snapshot tarball instead of warm-
+ *   restoring VM state. Use this for sandbox image builds so that the
+ *   restored sandbox bypasses the overlay-path constraints of non-CAS sandboxes.
+ */
+export type SnapshotType = "memory" | "filesystem";
+
+/**
+ * Checkpoint type for {@link Sandbox.checkpoint}.
+ *
+ * - `"memory"`: Capture VM memory + filesystem state. Sandboxes restored
+ *   from this checkpoint warm-restore VM memory and running processes.
+ * - `"filesystem"`: Capture filesystem state only. Sandboxes restored from
+ *   this checkpoint cold-boot from the snapshot tarball.
+ */
+export type CheckpointType = "memory" | "filesystem";
+
+export type SnapshotWaitCondition = "local_ready" | "completed";
+
+export enum ProcessStatus {
+  RUNNING = "running",
+  EXITED = "exited",
+  SIGNALED = "signaled",
+  OOM_KILLED = "oom_killed",
+}
+
+export enum StdinMode {
+  CLOSED = "closed",
+  PIPE = "pipe",
+}
+
+export enum OutputMode {
+  CAPTURE = "capture",
+  DISCARD = "discard",
+}
+
+export enum ContainerState {
+  IDLE = "Idle",
+  RUNNING = "Running",
+}
+
+// --- Resource / Network ---
+
+export interface ContainerResourcesInfo {
+  cpus: number;
+  memoryMb: number;
+  diskMb: number;
+  /** Reported GPU allocation. Include it in a pool update to retain the allocation. */
+  gpuConfigs?: GPUResources[];
+}
+
+/** GPU models supported by the sandbox scheduler. */
+export type GpuModel =
+  | "A100-40GB"
+  | "A100-80GB"
+  | "H100"
+  | "T4"
+  | "A6000"
+  | "RTX-PRO-6000"
+  | "L40"
+  | "A10";
+
+/** A homogeneous GPU allocation for a sandbox. */
+export interface GpuRequest {
+  count: number;
+  model: GpuModel;
+}
+
+export interface GPUResources {
+  count: number;
+  model: string;
+}
+
+/**
+ * Egress network access control policy for a sandbox.
+ *
+ * `denyOut` takes precedence over `allowOut`: a destination matched by both is
+ * blocked. Entries may be IPv4 addresses, CIDR ranges, or DNS hostnames;
+ * hostname rules are followed across DNS changes. The policy can be changed on
+ * a running sandbox via `Sandbox.update({ network })` (pass `null` to clear).
+ */
+export interface NetworkConfig {
+  allowInternetAccess: boolean;
+  allowOut: string[];
+  denyOut: string[];
+}
+
+/**
+ * One file system mounted into a sandbox at an absolute guest path.
+ *
+ * `fileSystemId` is the Artifact Storage file-system name created with
+ * `tl fs create <name>` and `mountPath` is an absolute, unique guest path
+ * (e.g. `/mnt/skills`).
+ *
+ * `readOnly` and `prefetch` are optional mount modes; they are sent on the
+ * wire only when `true` (older servers reject unknown mount fields, so
+ * `false` is expressed by omission).
+ *
+ * `snapshotId` pins the mount to a specific filesystem snapshot. A pinned
+ * mount must also set `readOnly: true` (the server rejects a writable pin
+ * with HTTP 400). It is sent only when set, for the same compatibility
+ * reason as the mount modes.
+ *
+ * `owner` presents the mounted files as owned by a guest user: `NAME`,
+ * `UID`, `NAME:GROUP`, or `UID:GID` (e.g. `"agent"` or `"1001:1001"`),
+ * resolved against the sandbox image's own user database when the mount
+ * attaches. Unset keeps the image default (the baked `tl-user` account when
+ * the image has one, otherwise root). It is sent only when set, for the
+ * same compatibility reason as the mount modes.
+ */
+export interface FileSystemMount {
+  fileSystemId: string;
+  mountPath: string;
+  /** Mount the file system read-only. */
+  readOnly?: boolean;
+  /** Eagerly download the file system's contents. */
+  prefetch?: boolean;
+  /** Pin the mount to a specific filesystem snapshot (requires `readOnly`). */
+  snapshotId?: string;
+  /** Present the mounted files as owned by this guest user spec. */
+  owner?: string;
+}
+
+/** Optional mount modes for attaching a file system to a running sandbox. */
+export interface AttachFileSystemOptions {
+  /** Mount the file system read-only. */
+  readOnly?: boolean;
+  /** Eagerly download the file system's contents. */
+  prefetch?: boolean;
+  /** Pin the mount to a specific filesystem snapshot (requires `readOnly`). */
+  snapshotId?: string;
+  /** Present the mounted files as owned by this guest user spec. */
+  owner?: string;
+}
+
+export interface ClaimSandboxOptions {
+  /** File systems to mount before the claimed sandbox is reported as running. */
+  fileSystems?: FileSystemMount[];
+}
+
+// --- Sandbox lifecycle ---
+
+export interface CreateSandboxOptions {
+  /** Allow proxy traffic to wake a suspended sandbox (default true). False requires a named sandbox. */
+  autoResume?: boolean;
+  /** Optional sandbox image name. GPU sandboxes require a CAS image; when omitted with a GPU request, Tensorlake uses the server's configured GPU default. */
+  image?: string;
+  /** CPU count. Defaults to 1 for fresh creates; snapshot restores inherit it when omitted. */
+  cpus?: number;
+  /** Memory in MiB. Defaults to 1024 for fresh creates; snapshot restores inherit it when omitted. */
+  memoryMb?: number;
+  /** Root disk size in MiB. When omitted, the server uses its default disk size. */
+  diskMb?: number;
+  /** Number of GPUs to allocate. Defaults to A10 unless gpuModel is set. GPU sandboxes require a CAS image. */
+  gpus?: number;
+  /** GPU model to allocate. Defaults to one GPU when gpus is omitted. The string arm preserves compatibility with existing callers; values are validated at runtime. */
+  gpuModel?: GpuModel | (string & {});
+  /** Typed GPU model and count request. Cannot be combined with gpus or gpuModel. */
+  gpu?: GpuRequest;
+  timeoutSecs?: number;
+  entrypoint?: string[];
+  allowInternetAccess?: boolean;
+  allowOut?: string[];
+  denyOut?: string[];
+  snapshotId?: string;
+  /** Whether exposed user ports are reachable without Tensorlake auth. Defaults to false for fresh creates; snapshot restores inherit it when omitted. */
+  allowUnauthenticatedAccess?: boolean;
+  /** User ports routable through the sandbox proxy. Port 9501 is reserved. Snapshot restores inherit ports when omitted; [] clears them. Does not enable unauthenticated access. */
+  exposedPorts?: number[];
+  /** Optional name for the sandbox. Named sandboxes support suspend/resume. When absent the sandbox is ephemeral. */
+  name?: string;
+  /** File systems to mount on fresh creation or warm-pool claim, each at its own absolute, unique guest mount path. */
+  fileSystems?: FileSystemMount[];
+  /**
+   * `false` returns a `PendingSandbox` handle as soon as the sandbox is
+   * durable, without waiting for it to run: `pending.ready()` waits,
+   * `pending.status()` looks, and `Sandbox.connect(pending.sandboxId)`
+   * collects it from any other process. `true` / unset waits as before.
+   */
+  wait?: boolean;
+  /**
+   * Longest the sandbox may wait for capacity before the server fails it with
+   * reason `no_capacity`. `0` fails at once when it cannot be placed; unset
+   * (the default) waits indefinitely. Applies to capacity waits only, not to
+   * image pull or boot. A bound shorter than the fleet's boot time (up to 20
+   * minutes on metal hosts) expires the very demand that made the autoscaler
+   * launch a host; 30 minutes or more is recommended for capacity waits.
+   */
+  maxPendingSecs?: number;
+}
+
+/**
+ * Bounded generation wait. Timeout never cancels a resize. Times are seconds.
+ * A zero timeout checks once without polling again.
+ */
+export interface ResourceResizeWaitOptions {
+  timeout?: number;
+  pollInterval?: number;
+}
+
+export enum ResizeStatus {
+  PENDING = "pending",
+  SUCCEEDED = "succeeded",
+  FAILED = "failed",
+}
+
+export enum ResizeErrorReason {
+  FAILED = "failed",
+  TIMEOUT = "timeout",
+  SUPERSEDED = "superseded",
+  INTERRUPTED = "interrupted",
+  INCOMPATIBLE_RESPONSE = "incompatible_response",
+}
+
+export interface SandboxResourceResizeInfo {
+  generation: number;
+  requested: ContainerResourcesInfo;
+  status: ResizeStatus | (string & {});
+  errorMessage?: string | null;
+}
+
+/** Wait options apply only to resource updates and are ignored for other properties. */
+export interface UpdateSandboxOptions extends ResourceResizeWaitOptions {
+  /** Change wake-on-traffic policy without waking or suspending the sandbox. Omit to keep it unchanged; false requires a named sandbox. Cannot be combined with resource resizing. */
+  autoResume?: boolean;
+  /** Whole live vCPU target; omitted retains the current allocation. */
+  cpus?: number;
+  /** Memory target in MiB, with the same units as create; never rounded by the SDK. */
+  memoryMb?: number;
+  /** Root disk target in MiB; can only grow. */
+  diskMb?: number;
+  /** Wait for resize completion (default true). False returns admission. */
+  wait?: boolean;
+  /** New name for the sandbox. Naming an ephemeral sandbox enables suspend/resume. */
+  name?: string;
+  /** Whether exposed user ports should be reachable without TensorLake auth. */
+  allowUnauthenticatedAccess?: boolean;
+  /** User ports that should be routable through the sandbox proxy. Port 9501 is reserved. */
+  exposedPorts?: number[];
+  /**
+   * Egress network policy for the running sandbox, applied to the live VM's
+   * firewall in one atomic swap. Omit to keep the current policy, set to
+   * replace it, or pass `null` to clear it to unrestricted egress.
+   */
+  network?: NetworkConfig | null;
+}
+
+/**
+ * Response from a blocking create or a pool claim.
+ *
+ * The server waits for readiness for at most the request timeout and can
+ * already report `running`; a `pending` answer carries a `pendingReason`.
+ * Use `connect(sandboxId)` to wait for a pending sandbox, or
+ * `create({ wait: false })` for a `PendingSandbox` handle.
+ */
+export interface CreateSandboxResponse {
+  sandboxId: string;
+  status: SandboxStatus;
+  reason?: string;
+  routingHint?: string;
+  ingressEndpoint?: string;
+  sandboxUrl?: string;
+  name?: string | null;
+  terminationReason?: string;
+  errorDetails?: unknown;
+  pendingReason?: string;
+}
+
+/**
+ * The acknowledgement of a `create({ wait: false })`: the wire record of a
+ * sandbox that is durable and starts whenever capacity allows. The
+ * `PendingSandbox` class in `pending-sandbox.ts` wraps it with `ready()` /
+ * `status()`. A server that predates `wait: false` answers the blocking
+ * create's shape instead, so `state` may already be `running`.
+ */
+export interface PendingSandboxRecord {
+  sandboxId: string;
+  name?: string;
+  state: SandboxStatus;
+  pendingReason?: string;
+  routingHint?: string;
+  ingressEndpoint?: string;
+  sandboxUrl?: string;
+  reason?: string;
+  terminationReason?: string;
+  errorDetails?: unknown;
+}
+
+export interface ReadyOptions {
+  /** Seconds to wait; defaults to the client requestTimeout. `0` observes the current state once. */
+  timeout?: number;
+  /** Seconds between `GET /sandboxes/{id}` polls. Default: 2. */
+  pollInterval?: number;
+  /**
+   * Delete the sandbox when `timeout` runs out while it is still pending,
+   * then throw `SandboxError` (the pre-ADR-0086 behaviour). Default false:
+   * throw `SandboxPending` and leave the sandbox queued.
+   */
+  cancelOnTimeout?: boolean;
+}
+
+export interface CopySandboxOptions {
+  /** Number of running copies to create. Defaults to 1. */
+  times?: number;
+  /** Per-request timeout in seconds for the blocking live-copy request. */
+  requestTimeout?: number;
+}
+
+export interface CopiedSandboxResponse {
+  sandboxId: string;
+  /** Raw server status. Partial copy responses can include statuses such as `"failed"`. */
+  status: string;
+  reason?: string;
+  routingHint?: string;
+  ingressEndpoint?: string;
+  sandboxUrl?: string;
+  name?: string | null;
+  terminationReason?: string;
+  errorDetails?: unknown;
+}
+
+export interface CopySandboxResponse {
+  sourceSandboxId: string;
+  sandboxes: CopiedSandboxResponse[];
+}
+
+export interface SandboxInfo {
+  /** Whether proxy traffic may wake this sandbox; defaults to true on older servers. */
+  autoResume: boolean;
+  /**
+   * The runtime the server chose for this sandbox: `firecracker`,
+   * `cloud-hypervisor` or `gvisor`. Informational only; it is never sent and
+   * is `firecracker` when the server recorded none.
+   */
+  runtime?: string;
+  resourceResize?: SandboxResourceResizeInfo | null;
+  sandboxId: string;
+  namespace: string;
+  status: SandboxStatus;
+  /** Resolved sandbox image name. */
+  image?: string;
+  resources: ContainerResourcesInfo;
+  timeoutSecs?: number;
+  entrypoint?: string[];
+  /** Egress network policy currently applied to the sandbox. */
+  networkPolicy?: NetworkConfig;
+  poolId?: string;
+  outcome?: string;
+  terminationReason?: string;
+  errorDetails?: unknown;
+  /** Why a pending sandbox is waiting, in snake_case. */
+  pendingReason?: string;
+  createdAt?: Date;
+  terminatedAt?: Date;
+  name?: string;
+  allowUnauthenticatedAccess?: boolean;
+  exposedPorts?: number[];
+  ingressEndpoint?: string;
+  sandboxUrl?: string;
+  routingHint?: string;
+  /** File systems currently mounted into the sandbox, each at its own guest mount path. Empty when none are mounted. */
+  fileSystems?: FileSystemMount[];
+}
+
+export interface SandboxPortAccess {
+  allowUnauthenticatedAccess: boolean;
+  exposedPorts: number[];
+  ingressEndpoint?: string;
+  sandboxUrl?: string;
+}
+
+/** Sandbox information plus the archival timestamp. */
+export interface ArchivedSandboxInfo extends SandboxInfo {
+  archivedAt: Date;
+}
+
+/** Pagination params for `listArchivedSandboxes`. */
+export interface ListArchivedSandboxesOptions {
+  limit?: number;
+  /** Base64-encoded pagination cursor returned by a prior call. */
+  cursor?: string;
+  /** Pagination direction. */
+  direction?: "forward" | "backward";
+}
+
+export interface ListArchivedSandboxesResponse {
+  sandboxes: ArchivedSandboxInfo[];
+  prevCursor?: string;
+  nextCursor?: string;
+}
+
+// --- Snapshots ---
+
+export interface CreateSnapshotResponse {
+  snapshotId: string;
+  status: SnapshotStatus;
+  /** Original response, populated when decoded by the SDK. */
+  raw?: Record<string, unknown>;
+}
+
+export interface SnapshotInfo {
+  snapshotId: string;
+  namespace: string;
+  sandboxId: string;
+  baseImage: string;
+  status: SnapshotStatus;
+  /** Original response, populated when decoded by the SDK. */
+  raw?: Record<string, unknown>;
+  snapshotType?: SnapshotType;
+  error?: string;
+  snapshotUri?: string;
+  snapshotFormatVersion?: string;
+  sizeBytes?: number;
+  rootfsDiskBytes?: number;
+  createdAt?: Date;
+}
+
+export interface SnapshotOptions {
+  /**
+   * Optional snapshot type. When omitted the server picks its default. Use
+   * `"filesystem"` for snapshots intended for sandbox image builds so that
+   * restored sandboxes cold-boot.
+   */
+  snapshotType?: SnapshotType;
+}
+
+export interface SnapshotAndWaitOptions extends SnapshotOptions {
+  timeout?: number;
+  pollInterval?: number;
+  /** Defaults to `"local_ready"`, which is enough to resume from a snapshot. */
+  waitUntil?: SnapshotWaitCondition;
+}
+
+// --- Persisted sandbox logs ---
+
+export type SandboxLogLevel =
+  "trace" | "debug" | "info" | "warn" | "error" | "fatal";
+
+export interface GetSandboxLogsOptions {
+  levels?: SandboxLogLevel[];
+  processIds?: string[];
+  nextToken?: string;
+  head?: number;
+  tail?: number;
+  body?: string;
+}
+
+export interface SandboxLogSignal {
+  timestamp: number;
+  uuid: string;
+  namespace: string;
+  application: string;
+  sandboxId?: string;
+  resourceAttributes: Array<[string, string]>;
+  body: string;
+  logAttributes: string;
+  allocations?: string[];
+  functionRuns?: string[];
+  level?: number;
+  retention?: number;
+}
+
+export interface SandboxLogsResponse {
+  logs: SandboxLogSignal[];
+  nextToken?: string;
+}
+
+export interface SandboxProcessLogFilter {
+  processId: string;
+  processPid: string;
+  processCommand: string;
+  processManagedId: string;
+  processManagedName: string;
+  firstSeen: number;
+  lastSeen: number;
+  logCount: number;
+}
+
+export interface SandboxProcessLogFiltersResponse {
+  processes: SandboxProcessLogFilter[];
+}
+
+// --- Pools ---
+
+export interface CreatePoolOptions {
+  /** Sandbox image name, such as `tensorlake/ubuntu-minimal` or a registered Sandbox Image. */
+  image: string;
+  cpus?: number;
+  memoryMb?: number;
+  /** Root disk size in MiB. Omit to use the registered image's size. */
+  diskMb?: number;
+  /** GPUs per container. Defaults to A10 unless gpuModel is set. GPU CAS pools require a CAS image. */
+  gpus?: number;
+  /** GPU model to allocate for each container. Defaults to one GPU when gpus is omitted. Validated at runtime. */
+  gpuModel?: GpuModel | (string & {});
+  /** Typed GPU allocation. Cannot be combined with gpus or gpuModel. */
+  gpu?: GpuRequest;
+  timeoutSecs?: number;
+  entrypoint?: string[];
+  maxContainers?: number;
+  warmContainers?: number;
+  /** Network policy for each container. Can be replaced later via updatePool. */
+  network?: NetworkConfig;
+}
+
+export interface UpdatePoolOptions {
+  /**
+   * Network policy for each container. Omit to keep the pool's current policy,
+   * set to replace it, or pass `null` to remove it (unclaimed warm containers
+   * are recycled onto the new policy).
+   */
+  network?: NetworkConfig | null;
+  /** Sandbox image name, such as `tensorlake/ubuntu-minimal` or a registered Sandbox Image. */
+  image: string;
+  cpus?: number;
+  memoryMb?: number;
+  /** Root disk size in MiB. Omit to use the registered image's size. */
+  diskMb?: number;
+  /** GPUs per container. Include on each update to keep a GPU CAS pool; omission configures a CPU-only CAS pool. Defaults to A10 unless gpuModel is set. */
+  gpus?: number;
+  /** GPU model to allocate for each container. Defaults to one GPU when gpus is omitted. Validated at runtime. */
+  gpuModel?: GpuModel | (string & {});
+  /** Typed GPU allocation. Cannot be combined with gpus or gpuModel. */
+  gpu?: GpuRequest;
+  timeoutSecs?: number;
+  entrypoint?: string[];
+  maxContainers?: number;
+  warmContainers?: number;
+}
+
+export interface CreateSandboxPoolResponse {
+  poolId: string;
+  namespace: string;
+}
+
+export interface PoolContainerInfo {
+  id: string;
+  state: string;
+  sandboxId?: string;
+  executorId: string;
+}
+
+export interface SandboxPoolInfo {
+  poolId: string;
+  namespace: string;
+  /** Sandbox image name backing the pool. */
+  image: string;
+  resources: ContainerResourcesInfo;
+  timeoutSecs: number;
+  entrypoint?: string[];
+  maxContainers?: number;
+  warmContainers?: number;
+  /** The network policy that applies to each container in the pool. */
+  networkPolicy?: NetworkConfig;
+  containers?: PoolContainerInfo[];
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+// --- Process management ---
+
+export interface ProcessUserSpec {
+  name?: string;
+  uid?: number;
+  gid?: number;
+}
+
+export type ProcessUser = string | ProcessUserSpec;
+
+export type RestartPolicy = "never" | "on_failure" | "always";
+
+export interface RestartPolicyConfig {
+  policy?: RestartPolicy;
+  maxRestarts?: number;
+  initialBackoffMs?: number;
+  maxBackoffMs?: number;
+}
+
+export type ProcessHealthCheckType = "http" | "tcp";
+
+export interface ProcessHealthCheck {
+  type: ProcessHealthCheckType;
+  port: number;
+  path?: string;
+  initialDelayMs?: number;
+  intervalMs?: number;
+  timeoutMs?: number;
+  failureThreshold?: number;
+}
+
+export type ManagedProcessStatus =
+  "starting" | "running" | "backing_off" | "stopped";
+
+export type ManagedProcessHealthStatus =
+  "disabled" | "starting" | "healthy" | "unhealthy";
+
+export interface ManagedProcessExit {
+  exitCode?: number;
+  signal?: number;
+  oomKilled: boolean;
+  endedAt: Date;
+}
+
+/**
+ * Managed-process metadata embedded into {@link ProcessInfo}.
+ *
+ * A managed process is addressable by either its current PID or, if a `name` was given at
+ * creation, that name (process APIs accept a PID or process name). `id` is a stable
+ * daemon-local identifier: it equals `name` when one was set, otherwise a daemon-assigned
+ * opaque id (the process is then addressable only by PID, not by `id`).
+ */
+export interface ManagedProcessInfo {
+  id: string;
+  name?: string;
+  status: ManagedProcessStatus;
+  restartCount: number;
+  restart: RestartPolicyConfig;
+  healthCheck?: ProcessHealthCheck;
+  healthStatus: ManagedProcessHealthStatus;
+  consecutiveHealthFailures: number;
+  lastExit?: ManagedProcessExit;
+  lastError?: string;
+  nextRestartAt?: Date;
+}
+
+export interface StartProcessOptions {
+  args?: string[];
+  env?: Record<string, string>;
+  workingDir?: string;
+  stdinMode?: StdinMode;
+  stdoutMode?: OutputMode;
+  stderrMode?: OutputMode;
+  user?: ProcessUser;
+  /**
+   * Optional managed-process name. Supplying this opts into managed process behavior, and
+   * lets the process be addressed by this name (in addition to its PID) in
+   * `getProcess`/`killProcess`/`sendSignal`/etc. — useful because a managed process's PID
+   * changes when it restarts. May contain any characters except `/` and must not be all
+   * digits (numeric strings are reserved for PID addressing). If omitted, the daemon assigns
+   * an opaque id (`ManagedProcessInfo.id`) and the process is addressable only by its current PID.
+   */
+  name?: string;
+  /** Optional restart behavior. Supplying this opts into managed process behavior. */
+  restart?: RestartPolicyConfig;
+  /** Optional HTTP/TCP health check. Supplying this opts into managed process behavior. */
+  healthCheck?: ProcessHealthCheck;
+}
+
+export interface ProcessInfo {
+  handle?: number;
+  pid: number;
+  status: ProcessStatus;
+  exitCode?: number;
+  signal?: number;
+  stdinWritable: boolean;
+  command: string;
+  args: string[];
+  startedAt: Date;
+  endedAt?: Date;
+  managed?: ManagedProcessInfo;
+}
+
+export interface SendSignalResponse {
+  success: boolean;
+}
+
+export interface OutputResponse {
+  pid: number;
+  lines: string[];
+  lineCount: number;
+}
+
+export interface OutputEvent {
+  line: string;
+  timestamp: Date;
+  stream?: string;
+}
+
+// --- Run ---
+
+export interface RunOptions {
+  args?: string[];
+  env?: Record<string, string>;
+  workingDir?: string;
+  timeout?: number;
+  user?: ProcessUser;
+}
+
+/** Why a command run with `Sandbox.run()` ended. */
+export enum CommandExitReason {
+  /** The process exited on its own; `exitCode` is its exit status. */
+  EXITED = "exited",
+  /** The process was killed by a signal; `exitCode` is `-signal`. */
+  SIGNALED = "signaled",
+  /** The kernel OOM killer terminated the process (`exitCode` is `-9`). */
+  OOM_KILLED = "oom_killed",
+  /** The run's `timeout` expired and the sandbox killed the process (`exitCode` is `-9`). */
+  TIMED_OUT = "timed_out",
+}
+
+export interface CommandResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  /**
+   * Why the command ended. `Sandbox.run()` always sets it; sandboxes that
+   * predate timeout reporting never report `TIMED_OUT`, so a timed-out run on
+   * them shows as `SIGNALED`.
+   */
+  reason?: CommandExitReason;
+  /** True when the run's `timeout` expired and the process was killed. */
+  timedOut?: boolean;
+}
+
+// --- File operations ---
+
+export interface DirectoryEntry {
+  name: string;
+  isDir: boolean;
+  size?: number;
+  modifiedAt?: Date;
+}
+
+export interface ListDirectoryResponse {
+  path: string;
+  entries: DirectoryEntry[];
+}
+
+// --- PTY ---
+
+export interface CreatePtySessionOptions {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  workingDir?: string;
+  rows?: number;
+  cols?: number;
+}
+
+export interface PtySessionInfo {
+  sessionId: string;
+  token: string;
+}
+
+// --- Health ---
+
+export interface HealthResponse {
+  healthy: boolean;
+}
+
+export interface DaemonInfo {
+  version: string;
+  uptimeSecs: number;
+  runningProcesses: number;
+  totalProcesses: number;
+}
+
+// --- Client options ---
+
+export interface SandboxClientOptions {
+  apiUrl?: string;
+  apiKey?: string;
+  organizationId?: string;
+  projectId?: string;
+  namespace?: string;
+  maxRetries?: number;
+  retryBackoffMs?: number;
+  /**
+   * HTTP request timeout in seconds. For a streamed response it bounds the
+   * wait for the stream to start and each wait for more data. Default: 300.
+   */
+  requestTimeout?: number;
+  /** @deprecated Use requestTimeout. HTTP request timeout in milliseconds. */
+  timeoutMs?: number;
+}
+
+export interface SandboxOptions {
+  sandboxId: string;
+  /**
+   * Explicit sandbox proxy base URL. Direct `new Sandbox(...)` construction
+   * requires this; `Sandbox.connect()` and `SandboxClient.connect()` normally
+   * resolve the server-returned `sandboxUrl`.
+   */
+  proxyUrl?: string;
+  /** @internal Real caller/env proxy override, distinct from an internally selected proxyUrl. */
+  explicitProxyUrl?: string;
+  apiKey?: string;
+  organizationId?: string;
+  projectId?: string;
+  routingHint?: string;
+  resolveProxyInfo?: (
+    identifier: string,
+  ) => Promise<SandboxInfo & { readonly traceId: string }>;
+  /**
+   * Optional HTTP request timeout in seconds for sandbox proxy operations. For
+   * streamed responses, such as `run()` and output follows, it bounds the wait
+   * for the stream to start and each wait for more data. Omit for no proxy
+   * timeout.
+   */
+  requestTimeout?: number;
+  /** @deprecated Use requestTimeout. Optional HTTP request timeout in milliseconds for sandbox proxy operations. */
+  timeoutMs?: number;
+  /**
+   * @internal Shared Rust-backed lifecycle client. When provided, the proxy
+   * client is minted via `connectProxy` so it reuses this client's connection
+   * pool (HTTP/2 coalescing across sandboxes).
+   */
+  nativeClient?: import("./native-sandbox.js").NativeSandboxClient;
+}
+
+export interface CreateAndConnectOptions extends CreateSandboxOptions {
+  poolId?: string;
+  proxyUrl?: string;
+  /** Total HTTP request timeout in seconds for sandbox startup. Default: client requestTimeout. */
+  requestTimeout?: number;
+  /** @deprecated Use requestTimeout. */
+  startupTimeout?: number;
+  /**
+   * Delete the sandbox when `requestTimeout` runs out while it is still
+   * pending, then throw `SandboxError` (the pre-ADR-0086 behaviour). Default
+   * false: throw `SandboxPending` and leave the sandbox queued.
+   */
+  cancelOnTimeout?: boolean;
+  /**
+   * Seconds between readiness polls once the server's own wait has run out.
+   * Default: 2.
+   */
+  pollInterval?: number;
+}
+
+/**
+ * Options for `Sandbox.getOrCreate`: everything `create` accepts (used only
+ * when a new sandbox must be created; `name` comes from the first argument),
+ * plus `resume`. `poolId` is excluded: a pool claim cannot carry a name, so
+ * a claimed sandbox could never be found again by a later call.
+ */
+export interface GetOrCreateOptions
+  extends Omit<CreateAndConnectOptions, "name" | "poolId"> {
+  /** Resume a suspended sandbox before returning. Default: true. */
+  resume?: boolean;
+}
+
+/**
+ * What `Sandbox.getOrCreate` did to bind the name, exposed as
+ * `sandbox.bindOutcome`:
+ *
+ * - `"created"`: nothing held the name; the call created a new sandbox.
+ * - `"attached"`: a sandbox already held the name and needed no resume.
+ *   Includes a sandbox that was still starting (the call waited for it)
+ *   and a suspended sandbox when `resume: false`.
+ * - `"resumed"`: the sandbox was suspended when the call found it and is
+ *   running now.
+ */
+export type GetOrCreateOutcome = "created" | "attached" | "resumed";
+
+export interface SuspendResumeOptions {
+  /** If false, fire-and-return without waiting for completion. Default: true. */
+  wait?: boolean;
+  /** Max seconds to wait when wait=true. Default: 300. */
+  timeout?: number;
+  /** Seconds between status polls when wait=true. Default: 1. */
+  pollInterval?: number;
+}
+
+export interface CheckpointOptions extends SuspendResumeOptions {
+  checkpointType?: CheckpointType;
+  /** Defaults to `"local_ready"`, which is enough to resume from a checkpoint. */
+  waitUntil?: SnapshotWaitCondition;
+}
+
+export interface ConnectOptions {
+  sandboxId: string;
+  proxyUrl?: string;
+  routingHint?: string;
+}
+
+// --- JSON key conversion helpers ---
+
+const CAMEL_TO_SNAKE_RE = /[A-Z]/g;
+
+/** Convert a camelCase string to snake_case. */
+export function camelToSnake(str: string): string {
+  return str.replace(CAMEL_TO_SNAKE_RE, (ch) => "_" + ch.toLowerCase());
+}
+
+/** Convert a snake_case string to camelCase. */
+export function snakeToCamel(str: string): string {
+  return str.replace(/_([a-z])/g, (_, ch) => ch.toUpperCase());
+}
+
+/** Recursively convert all object keys from camelCase to snake_case. */
+export function toSnakeKeys(obj: unknown): unknown {
+  if (Array.isArray(obj)) return obj.map(toSnakeKeys);
+  if (obj !== null && typeof obj === "object" && !(obj instanceof Date)) {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+      result[camelToSnake(k)] = toSnakeKeys(v);
+    }
+    return result;
+  }
+  return obj;
+}
+
+/**
+ * Parse a numeric timestamp into a Date.
+ *
+ * Handles seconds, milliseconds, and microseconds by checking magnitude.
+ */
+export function parseTimestamp(v: unknown): Date | undefined {
+  if (v == null) return undefined;
+  if (v instanceof Date) return v;
+  if (typeof v === "string") {
+    const parsed = Date.parse(v);
+    return Number.isNaN(parsed) ? undefined : new Date(parsed);
+  }
+  const ts = Number(v);
+  if (isNaN(ts)) return undefined;
+  if (ts > 1e15) return new Date(ts / 1000); // microseconds → ms
+  if (ts > 1e12) return new Date(ts); // already ms
+  return new Date(ts * 1000); // seconds → ms
+}
+
+/**
+ * Recursively convert all object keys from snake_case to camelCase,
+ * with special handling for `id` → contextual name and timestamp parsing.
+ */
+export function fromSnakeKeys(obj: unknown, idField?: string): unknown {
+  if (Array.isArray(obj))
+    return obj.map((item) => fromSnakeKeys(item, idField));
+  if (obj !== null && typeof obj === "object" && !(obj instanceof Date)) {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+      let key: string;
+      if (k === "id" && idField) {
+        key = idField;
+      } else {
+        key = snakeToCamel(k);
+      }
+
+      // Parse timestamp fields
+      if (
+        key.endsWith("At") ||
+        key === "timestamp" ||
+        key === "startedAt" ||
+        key === "endedAt"
+      ) {
+        result[key] = parseTimestamp(v);
+      } else if (typeof v === "object" && v !== null && !Array.isArray(v)) {
+        result[key] = fromSnakeKeys(v);
+      } else if (Array.isArray(v)) {
+        result[key] = v.map((item) => fromSnakeKeys(item));
+      } else {
+        // Normalize null → undefined so optional fields match TypeScript's ? convention.
+        result[key] = v === null ? undefined : v;
+      }
+    }
+    return result;
+  }
+  return obj;
+}

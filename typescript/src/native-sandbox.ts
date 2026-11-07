@@ -1,0 +1,548 @@
+import { CommandExitReason, fromSnakeKeys } from "./models.js";
+import {
+  PoolInUseError,
+  PoolNotFoundError,
+  RemoteAPIError,
+  SandboxConnectionError,
+  SandboxError,
+  SandboxResizeError,
+  SandboxNotFoundError,
+} from "./errors.js";
+import { workerBinding } from "./native-worker-client.js";
+import type { NativeCloudClient } from "./native-cloud.js";
+import { cancelNativeCall, type NativeCall } from "./native-worker-protocol.js";
+
+/**
+ * Bridge to the Rust core's sandbox lifecycle + proxy clients (`napi-rs`).
+ *
+ * The proxy data path (process/file/stream ops) is served by the Rust core so
+ * it shares `reqwest`'s connection pool — replacing the previous undici path,
+ * which multiplexed every parallel request onto a single, untuned HTTP/2
+ * connection. The native binding is required: there is no JS fallback.
+ *
+ * Convention (mirrors the Python binding): structured payloads cross as JSON
+ * strings, bytes as `Buffer`, and every call surfaces the W3C `traceId`.
+ * Errors arrive as a JSON `{category, status, message}` string in the native
+ * error message; {@link translateNativeError} rethrows them as the SDK's typed
+ * errors.
+ */
+
+// ---- Native value shapes --------------------------------------------------
+
+export interface TracedJson {
+  traceId: string;
+  json: string;
+}
+
+export interface TracedBytes {
+  traceId: string;
+  data: Uint8Array;
+  contentId?: string;
+  fullSize?: number;
+}
+
+export interface TracedEvents {
+  traceId: string;
+  events: string[];
+}
+
+/** Per-event callback used by the streaming proxy methods. */
+export type NativeEmit = (eventJson: string) => void | Promise<void>;
+
+export interface NativeSandboxProxyClient {
+  baseUrl(): string;
+
+  startProcess(payloadJson: string): Promise<TracedJson>;
+  listProcesses(): Promise<TracedJson>;
+  // `process` is the pid-or-name path segment (the TS layer stringifies the number|string arg).
+  getProcess(process: string): Promise<TracedJson>;
+  killProcess(process: string): Promise<string>;
+  restartProcess(process: string): Promise<TracedJson>;
+  sendSignal(process: string, signal: number): Promise<TracedJson>;
+  writeStdin(process: string, data: Buffer): Promise<string>;
+  closeStdin(process: string): Promise<string>;
+  getStdout(process: string): Promise<TracedJson>;
+  getStderr(process: string): Promise<TracedJson>;
+  getOutput(process: string): Promise<TracedJson>;
+
+  followStdout(process: string, emit: NativeEmit): Promise<string>;
+  followStderr(process: string, emit: NativeEmit): Promise<string>;
+  followOutput(process: string, emit: NativeEmit): Promise<string>;
+  runProcess(payloadJson: string): Promise<TracedEvents>;
+  runProcessStreaming(payloadJson: string, emit: NativeEmit): Promise<string>;
+
+  readFile(path: string): Promise<TracedBytes>;
+  writeFile(path: string, content: Buffer): Promise<string>;
+  uploadFile(path: string, localPath: string): Promise<string>;
+  deleteFile(path: string): Promise<string>;
+  listDirectory(path: string): Promise<TracedJson>;
+
+  createPtySession(payloadJson: string): Promise<TracedJson>;
+  deletePtySession(sessionId: string): Promise<string>;
+  health(): Promise<TracedJson>;
+  info(): Promise<TracedJson>;
+}
+
+export interface NativeSandboxClient {
+  createSandbox(requestJson: string): Promise<TracedJson>;
+  /** Blocking create for createAndConnect: a `running`, `failed` or `timeout` record. */
+  createSandboxAndWait(requestJson: string): Promise<TracedJson>;
+  /** Wait-free create (`wait: false`, ADR 0086). */
+  createSandboxNoWait(requestJson: string): Promise<TracedJson>;
+  /** Poll the sandbox until it leaves `pending` or the budget runs out; resolves with the last `SandboxInfo`. */
+  waitForSandbox(
+    sandboxId: string,
+    timeoutSec: number,
+    pollIntervalSec?: number | null,
+  ): Promise<TracedJson>;
+  claimSandbox(poolId: string, requestJson?: string): Promise<TracedJson>;
+  copySandbox(sandboxId: string, times: number): Promise<TracedJson>;
+  getSandbox(sandboxId: string): Promise<TracedJson>;
+  listSandboxes(): Promise<TracedJson>;
+  listArchivedSandboxes(
+    limit?: number | null,
+    cursor?: string | null,
+    direction?: string | null,
+  ): Promise<TracedJson>;
+  getArchivedSandbox(sandboxId: string): Promise<TracedJson>;
+  getSandboxLogs(requestJson: string): Promise<TracedJson>;
+  listSandboxLogProcesses(sandboxId: string): Promise<TracedJson>;
+  updateSandbox(
+    sandboxId: string, requestJson: string, wait?: boolean,
+    timeoutSec?: number, pollIntervalSec?: number,
+  ): Promise<TracedJson>;
+  waitForResourceResize(
+    sandboxId: string, generation: number,
+    timeoutSec?: number, pollIntervalSec?: number,
+  ): Promise<TracedJson>;
+  deleteSandbox(sandboxId: string): Promise<string>;
+  suspendSandbox(sandboxId: string): Promise<string>;
+  resumeSandbox(sandboxId: string): Promise<string>;
+  suspendSandboxAndWait(sandboxId: string, waitSec: number): Promise<boolean>;
+  resumeSandboxAndWait(sandboxId: string, waitSec: number): Promise<boolean>;
+  attachFileSystem(
+    sandboxId: string,
+    fileSystemId: string,
+    mountPath: string,
+    readOnly?: boolean | null,
+    prefetch?: boolean | null,
+    snapshotId?: string | null,
+    owner?: string | null,
+  ): Promise<TracedJson>;
+  detachFileSystem(
+    sandboxId: string,
+    mountPath: string,
+  ): Promise<TracedJson>;
+  createSnapshot(
+    sandboxId: string,
+    snapshotType?: string | null,
+  ): Promise<TracedJson>;
+  getSnapshot(snapshotId: string): Promise<TracedJson>;
+  listSnapshots(): Promise<TracedJson>;
+  listSandboxSnapshots(sandboxId: string): Promise<TracedJson>;
+  deleteSnapshot(snapshotId: string): Promise<string>;
+  createPool(requestJson: string): Promise<TracedJson>;
+  getPool(poolId: string): Promise<TracedJson>;
+  listPools(): Promise<TracedJson>;
+  updatePool(poolId: string, requestJson: string): Promise<TracedJson>;
+  deletePool(poolId: string): Promise<string>;
+
+  connectProxy(
+    proxyUrl: string,
+    sandboxId: string,
+    routingHint?: string | null,
+    requestTimeoutSec?: number | null,
+  ): NativeSandboxProxyClient;
+  selectSandboxProxyUrl(
+    sandboxId: string,
+    sandboxUrl?: string | null,
+    ingressEndpoint?: string | null,
+    explicitProxyUrl?: string | null,
+  ): string | Promise<string>;
+}
+
+export interface NativeRepositoryClient {
+  gitRepoUrl(repo: string): Promise<string>;
+  createRepo(repo: string, defaultBranch?: string | null): Promise<TracedJson>;
+  listRepos(): Promise<TracedJson>;
+  deleteRepo(repo: string): Promise<string>;
+  forkRepo(repo: string, baseRepo: string): Promise<TracedJson>;
+  archiveRepo(repo: string): Promise<string>;
+  restoreRepo(repo: string): Promise<string>;
+  repoInfo(repo: string): Promise<TracedJson>;
+  listBranches(repo: string): Promise<TracedJson>;
+  listRefs(repo: string): Promise<TracedJson>;
+  deleteBranch(repo: string, branch: string): Promise<string>;
+  listOperations(repo: string): Promise<TracedJson>;
+  gitCredential(repo?: string | null): Promise<string>;
+  commitStatus(repo: string, jobId: string): Promise<TracedJson>;
+  pushWorktree(
+    repo: string,
+    root: string,
+    branch: string,
+    message: string,
+    expectOid?: string | null,
+  ): Promise<TracedJson>;
+  mergeRepo(
+    repo: string,
+    ours: string,
+    theirs: string,
+    preflight: boolean,
+    deep: boolean,
+    materialize: boolean,
+    message?: string | null,
+    base?: string | null,
+  ): Promise<TracedJson>;
+  commitConflicts(repo: string, commit: string): Promise<TracedJson>;
+  createFilesystem(name: string, region?: string): Promise<string>;
+  forkFilesystem(
+    name: string,
+    base: string,
+    snapshot?: string | null,
+  ): Promise<TracedJson>;
+  listFilesystems(): Promise<TracedJson>;
+  filesystemMeta(name: string): Promise<TracedJson>;
+  deleteFilesystem(name: string): Promise<string>;
+  filesystemRefStatus(name: string, refspec: string): Promise<TracedJson>;
+  retainFilesystemSnapshot(
+    name: string,
+    message: string,
+    requestId: string,
+  ): Promise<TracedJson>;
+  listFilesystemSnapshots(name: string): Promise<TracedJson>;
+  deleteFilesystemSnapshot(name: string, snapshot: string): Promise<string>;
+  readFilesystemFile(
+    name: string,
+    path: string,
+    version: string,
+    offset?: number,
+    length?: number,
+  ): Promise<TracedBytes>;
+  listFilesystemTree(
+    name: string,
+    dirPath: string,
+    version: string,
+  ): Promise<TracedJson>;
+  pushFilesystemFiles(
+    name: string,
+    files: Array<{ path: string; content: Buffer }>,
+    deletes: string[],
+    moves: Array<{ from: string; to: string }>,
+    copies: Array<{ from: string; to: string }>,
+    message: string,
+    branch: string,
+    idempotencyKey?: string | null,
+  ): Promise<TracedJson>;
+  pushFilesystemPaths(
+    name: string,
+    files: Array<{ path: string; localPath: string }>,
+    message: string,
+    branch: string,
+    idempotencyKey?: string | null,
+  ): Promise<TracedJson>;
+}
+
+interface NativeSandboxClientCtor {
+  new (
+    apiUrl: string,
+    apiKey?: string | null,
+    organizationId?: string | null,
+    projectId?: string | null,
+    namespace?: string | null,
+    userAgent?: string | null,
+    requestTimeoutSec?: number | null,
+  ): NativeSandboxClient;
+}
+
+interface NativeRepositoryClientCtor {
+  new (
+    apiUrl: string,
+    apiKey?: string | null,
+    organizationId?: string | null,
+    projectId?: string | null,
+    userAgent?: string | null,
+    requestTimeoutSec?: number | null,
+  ): NativeRepositoryClient;
+}
+
+export interface NativeUsageClient {
+  summary(
+    last: string | null,
+    fromDate: string | null,
+    toDate: string | null,
+  ): Promise<TracedJson>;
+  sandboxes(
+    last: string | null,
+    fromDate: string | null,
+    toDate: string | null,
+  ): Promise<TracedJson>;
+}
+
+interface NativeUsageClientCtor {
+  new (
+    apiUrl: string,
+    apiKey: string | null,
+    organizationId: string,
+    userAgent?: string | null,
+    requestTimeoutSec?: number | null,
+  ): NativeUsageClient;
+}
+
+interface NativeSandboxProxyClientCtor {
+  new (
+    proxyUrl: string,
+    sandboxId: string,
+    apiKey?: string | null,
+    organizationId?: string | null,
+    projectId?: string | null,
+    routingHint?: string | null,
+    userAgent?: string | null,
+    requestTimeoutSec?: number | null,
+  ): NativeSandboxProxyClient;
+}
+
+export interface NativeSandboxBinding {
+  NativeTcpTunnel: new () => NativeTcpTunnel;
+  NativeCloudClient?: new (optionsJson: string) => NativeCloudClient;
+  NativeSandboxClient: NativeSandboxClientCtor;
+  NativeSandboxProxyClient: NativeSandboxProxyClientCtor;
+  NativeRepositoryClient?: NativeRepositoryClientCtor;
+  NativeUsageClient?: NativeUsageClientCtor;
+  /** Validate a managed-process name; throws on failure. Single source-of-truth rule in Rust. */
+  validateManagedName: (name: string) => void | Promise<void>;
+}
+
+export interface NativeTcpTunnel {
+  listen(
+    baseUrl: string,
+    headers: Record<string, string>,
+    remotePort: number,
+    localHost: string,
+    localPort: number,
+    timeout: number,
+  ): Promise<number>;
+  close(): Promise<void>;
+  waitClosed(): Promise<void>;
+}
+
+// ---- Binding loader -------------------------------------------------------
+
+let cachedBinding: NativeSandboxBinding | undefined;
+export function loadNativeSandboxBinding(): NativeSandboxBinding {
+  return cachedBinding ??= workerBinding();
+}
+
+/** Test seam: replace (or clear) the native binding. */
+export function __setNativeSandboxBindingForTest(
+  binding: NativeSandboxBinding | undefined,
+): void {
+  cachedBinding = binding;
+}
+
+// ---- Error translation ----------------------------------------------------
+
+interface NativeErrorPayload {
+  category: string;
+  status: number | null;
+  message: string;
+}
+
+/** Context used to reconstruct entity-specific typed errors from a 404/409. */
+export interface NativeErrorContext {
+  sandboxId?: string;
+  poolId?: string;
+  /**
+   * When set, a 404 maps to the typed not-found error for that entity
+   * (`SandboxNotFoundError` / `PoolNotFoundError`). Lifecycle ops set it;
+   * proxy/data-plane ops omit it so a 404 (e.g. missing file or process)
+   * stays a generic `RemoteAPIError`, matching the pre-shim behavior.
+   */
+  notFoundKind?: "sandbox" | "pool";
+}
+
+function parseNativeError(error: unknown): NativeErrorPayload | null {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "";
+  if (!message) return null;
+  try {
+    const parsed = JSON.parse(message) as Partial<NativeErrorPayload>;
+    if (parsed && typeof parsed.category === "string") {
+      return {
+        category: parsed.category,
+        status: typeof parsed.status === "number" ? parsed.status : null,
+        message: typeof parsed.message === "string" ? parsed.message : message,
+      };
+    }
+  } catch {
+    // Not a structured native error — fall through.
+  }
+  return null;
+}
+
+/**
+ * Map a native error to the SDK's typed error hierarchy, matching the status
+ * codes the undici path produced (404 → SandboxNotFoundError/PoolNotFoundError,
+ * 409 → PoolInUseError, connection failures → SandboxConnectionError).
+ */
+export function translateNativeError(
+  error: unknown,
+  context?: NativeErrorContext,
+): Error {
+  const payload = parseNativeError(error);
+  if (!payload) {
+    if (error instanceof Error) return error;
+    return new SandboxError(String(error));
+  }
+
+  const { category, status, message } = payload;
+
+  if (category === "resize") {
+    return new SandboxResizeError(
+      fromSnakeKeys(JSON.parse(message), "sandboxId") as ConstructorParameters<typeof SandboxResizeError>[0],
+    );
+  }
+  if (category === "connection") {
+    return new SandboxConnectionError(message, { cause: error });
+  }
+
+  if (status === 404) {
+    if (context?.notFoundKind === "pool" && context.poolId) {
+      return new PoolNotFoundError(context.poolId);
+    }
+    if (context?.notFoundKind === "sandbox" && context.sandboxId) {
+      return new SandboxNotFoundError(context.sandboxId);
+    }
+    return new RemoteAPIError(404, message);
+  }
+
+  if (status === 409 && context?.poolId) {
+    return new PoolInUseError(context.poolId, message);
+  }
+
+  if (typeof status === "number") {
+    return new RemoteAPIError(status, message);
+  }
+
+  return new SandboxError(message);
+}
+
+/** Run a native call, translating any error to the SDK's typed hierarchy. */
+export async function callNative<T>(
+  fn: () => Promise<T>,
+  context?: NativeErrorContext,
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    throw translateNativeError(error, context);
+  }
+}
+
+// ---- Streaming bridge -----------------------------------------------------
+
+/**
+ * Adapt the native per-event callback API into an async generator, preserving
+ * the live-streaming semantics of `followStdout`/`followStderr`/`followOutput`.
+ * The native `start` call resolves once the upstream stream closes. Each emit
+ * resolves only after consumption, propagating backpressure through the worker
+ * to Rust. Cancellation drops the upstream response, including quiet streams.
+ */
+export async function* nativeEventStream(
+  start: (emit: NativeEmit) => Promise<string>,
+  context?: NativeErrorContext,
+  signal?: AbortSignal,
+): AsyncGenerator<Record<string, unknown>> {
+  if (signal?.aborted) return;
+  const queue: Array<{ value: string; consumed: () => void }> = [];
+  let wake: (() => void) | undefined;
+  let finished = false;
+  let stopped = false;
+  let failure: unknown;
+  const notify = () => { const resolve = wake; wake = undefined; resolve?.(); };
+  const emit: NativeEmit = (value) => {
+    if (stopped) return Promise.resolve();
+    return new Promise<void>((consumed) => { queue.push({ value, consumed }); notify(); });
+  };
+  let call: NativeCall<string> | undefined;
+  const onAbort = () => { stopped = true; call?.[cancelNativeCall]?.(); notify(); };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    call = start(emit);
+    void call.catch((error: unknown) => { failure = error; }).finally(() => { finished = true; notify(); });
+    while (!stopped) {
+      const event = queue.shift();
+      if (event) {
+        try { yield JSON.parse(event.value) as Record<string, unknown>; }
+        finally { event.consumed(); }
+      } else if (finished) {
+        break;
+      } else {
+        await new Promise<void>((resolve) => { wake = resolve; });
+      }
+    }
+    if (!stopped && failure !== undefined) throw translateNativeError(failure, context);
+  } finally {
+    stopped = true;
+    signal?.removeEventListener("abort", onAbort);
+    call?.[cancelNativeCall]?.();
+    for (const event of queue) event.consumed();
+  }
+}
+
+/**
+ * Reduce the buffered `runProcess` events into a `CommandResult`, matching the
+ * SSE-parsing logic the undici `run()` path used.
+ */
+export function assembleCommandResult(events: string[]): {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  reason?: CommandExitReason;
+} {
+  const stdoutLines: string[] = [];
+  const stderrLines: string[] = [];
+  let exitCode = -1;
+  let reason: CommandExitReason | undefined;
+
+  for (const eventJson of events) {
+    const raw = JSON.parse(eventJson) as Record<string, unknown>;
+    if (typeof raw.line === "string") {
+      if (raw.stream === "stderr") {
+        stderrLines.push(raw.line);
+      } else {
+        stdoutLines.push(raw.line);
+      }
+    } else if ("exit_code" in raw || "signal" in raw) {
+      if (typeof raw.exit_code === "number") {
+        exitCode = raw.exit_code;
+      } else if (typeof raw.signal === "number") {
+        exitCode = -raw.signal;
+      } else {
+        continue;
+      }
+      reason = exitReason(raw);
+    }
+  }
+
+  return { exitCode, stdout: stdoutLines.join("\n"), stderr: stderrLines.join("\n"), reason };
+}
+
+const KNOWN_EXIT_REASONS = new Set<string>(Object.values(CommandExitReason));
+
+/**
+ * The daemon's reported exit reason. Sandboxes that predate the field, or a
+ * reason this SDK does not know, fall back to one derived from how the process
+ * ended; a timeout is only ever reported by the sandbox, never inferred.
+ */
+function exitReason(raw: Record<string, unknown>): CommandExitReason {
+  if (typeof raw.reason === "string" && KNOWN_EXIT_REASONS.has(raw.reason)) {
+    return raw.reason as CommandExitReason;
+  }
+  if (raw.oom_killed === true) return CommandExitReason.OOM_KILLED;
+  if (typeof raw.exit_code === "number") return CommandExitReason.EXITED;
+  return CommandExitReason.SIGNALED;
+}

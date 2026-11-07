@@ -1,0 +1,126 @@
+name: Release - Python SDK (PyPI)
+
+run-name: "Release - Python SDK (PyPI) · ${{ github.ref_name }} · @${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+
+jobs:
+  notify-start:
+    name: Notify Slack that the release is starting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: echo "version=$(grep -m1 -E '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack
+        continue-on-error: true
+        uses: ./.github/actions/notify-release
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          package: Python SDK (PyPI)
+          version: ${{ steps.version.outputs.version }}
+          package-url: https://pypi.org/project/tensorlake/${{ steps.version.outputs.version }}/
+
+  build-wheels:
+    name: Build wheels on ${{ matrix.platform.os }} (${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: namespace-profile-rust-builder-amd64
+            target: x86_64
+            manylinux: auto
+          # Native arm64 runner + native PyPA image: the manylinux2014-cross image's
+          # GCC 4.8 miscompiles ring's aarch64 crypto (TLS BadSignature at runtime).
+          - os: ubuntu-24.04-arm
+            target: aarch64
+            manylinux: '2014'
+            manylinux_container: quay.io/pypa/manylinux2014_aarch64:latest
+          - os: macos-15
+            target: aarch64
+            rust_target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust_target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vendor canonical Function Agent core
+        uses: ./.github/actions/vendor-function-agent-core
+        with:
+          app-id: ${{ secrets.COMPUTE_ENGINE_APP_ID }}
+          private-key: ${{ secrets.COMPUTE_ENGINE_APP_PRIVATE_KEY }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Rust toolchain
+        if: runner.os != 'Linux'
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: ${{ matrix.platform.rust_target }}
+
+      - name: Cache Rust build artifacts (macOS)
+        if: runner.os == 'macOS'
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-no-bin
+          cache-bin: false
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        env:
+          CARGO_TARGET_DIR: target
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          manylinux: ${{ matrix.platform.manylinux || 'auto' }}
+          container: ${{ matrix.platform.manylinux_container || '' }}
+          sccache: 'true'
+
+      - name: Verify wheel imports Rust Cloud SDK extension
+        run: |
+          python .github/scripts/verify_wheel.py "dist/tensorlake-*.whl" tensorlake._cloud_sdk tensorlake.cli.deploy --tls-check https://api.tensorlake.ai --expect-script function-executor --expect-script tensorlake-python-function-runner --expect-script tensorlake-deploy --reject-script tl --reject-script tensorlake
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          path: dist
+
+  publish:
+    name: Publish to PyPI
+    # The private Function Agent implementation is compiled into wheels. Publishing an sdist
+    # would either expose that source or produce an artifact that cannot build from public files.
+    needs: [build-wheels]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/tensorlake
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          verbose: true

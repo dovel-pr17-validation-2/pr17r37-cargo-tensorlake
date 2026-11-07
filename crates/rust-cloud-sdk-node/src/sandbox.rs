@@ -1,0 +1,1462 @@
+//! napi-rs bindings for the Tensorlake sandbox lifecycle + proxy clients.
+//!
+//! Mirrors the surface `crates/rust-cloud-sdk-py` exposes to Python so both
+//! language SDKs delegate to the same Rust implementation (and therefore share
+//! its `reqwest` connection pool and HTTP/2 connection coalescing). HTTP
+//! operations are async. Synchronous constructors only retain configuration;
+//! transport and certificate initialization happens on a blocking worker.
+//!
+//! Conventions (kept identical to the Python binding):
+//! - JSON in / JSON out: request bodies and structured responses cross the
+//!   boundary as JSON strings; `serde_json` handles (de)serialization.
+//! - Bytes use `Buffer`.
+//! - Every call surfaces the W3C `trace_id` alongside its payload.
+//! - Errors are encoded as a JSON `{category, status, message}` string in the
+//!   napi error reason so the TypeScript layer can rethrow typed errors
+//!   (`SandboxNotFoundError`, `PoolInUseError`, ...).
+
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tensorlake::sandboxes::resize::ResizeOptions;
+use tokio::sync::OnceCell;
+
+use napi::bindgen_prelude::{Buffer, Either, Promise};
+use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
+use napi::{Env, JsFunction, JsObject};
+use napi_derive::napi;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+
+use tensorlake::sandboxes::models::{
+    ArchivedSandboxesPaginationDirection, ClaimSandboxRequest, CreateSandboxPoolRequest,
+    CreateSandboxRequest, GetSandboxLogsRequest, ListArchivedSandboxesParams, SnapshotType,
+    UpdateSandboxPoolRequest, UpdateSandboxRequest,
+};
+use tensorlake::sandboxes::{
+    DEFAULT_WAIT_POLL_INTERVAL, SandboxProxyClient, SandboxProxyTarget, SandboxesClient,
+    resolve_sandbox_proxy_target, select_sandbox_proxy_url,
+};
+use tensorlake::{
+    ClientBuilder,
+    error::{SdkError, TransportFailure},
+    retry::{RetryPolicy, retry},
+};
+
+// ---- Return value objects -------------------------------------------------
+
+/// A JSON payload paired with the request's W3C trace id. `json` is the
+/// JSON-encoded response body; the TS layer parses it.
+#[napi(object)]
+pub struct TracedJson {
+    pub trace_id: String,
+    pub json: String,
+}
+
+/// A binary payload paired with the request's W3C trace id.
+#[napi(object)]
+pub struct TracedBytes {
+    pub trace_id: String,
+    pub data: Buffer,
+    pub content_id: Option<String>,
+    pub full_size: Option<f64>,
+}
+
+/// A list of JSON-encoded events paired with the request's W3C trace id.
+#[napi(object)]
+pub struct TracedEvents {
+    pub trace_id: String,
+    pub events: Vec<String>,
+}
+
+// ---- Error encoding -------------------------------------------------------
+
+fn make_napi_error(category: &str, status: Option<u16>, message: String) -> napi::Error {
+    let payload = serde_json::json!({
+        "category": category,
+        "status": status,
+        "message": message,
+    });
+    napi::Error::from_reason(payload.to_string())
+}
+
+/// Map an [`SdkError`] to a structured napi error. Mirrors the Python binding's
+/// `into_sandbox_py_error` so both SDKs classify failures identically.
+///
+/// Transport failures are classified with [`SdkError::transport_failure`], not
+/// by inspecting the message. Every request in this binding goes through
+/// `reqwest_middleware`, so a connect failure arrives as
+/// `SdkError::Middleware` rendering as `error sending request for url (...)` —
+/// a string that contains neither "connect" nor "timeout". Classifying it by
+/// substring reported real DNS and TCP failures as opaque internal errors.
+pub(crate) fn into_napi_error(error: SdkError) -> napi::Error {
+    match error.into_original() {
+        SdkError::SandboxResize(error) => make_napi_error(
+            "resize",
+            None,
+            serde_json::to_string(&error).expect("serializable resize error"),
+        ),
+        SdkError::Authentication(message) => make_napi_error("sdk_usage", Some(401), message),
+        SdkError::Authorization(message) => make_napi_error("sdk_usage", Some(403), message),
+        SdkError::ServerError { status, message } => {
+            make_napi_error("remote_api", Some(status.as_u16()), message)
+        }
+        other => match other.transport_failure() {
+            // `detail()` appends the source chain, which is where reqwest keeps
+            // the part that names the failure (`tcp connect error`, `dns
+            // error`). Without it the caller sees only the generic wrapper.
+            Some(TransportFailure::Timeout) => {
+                make_napi_error("connection", Some(504), other.detail())
+            }
+            Some(TransportFailure::Connect) => {
+                make_napi_error("connection", Some(503), other.detail())
+            }
+            None => make_napi_error("internal", None, other.detail()),
+        },
+    }
+}
+
+pub(crate) fn usage_error(message: String) -> napi::Error {
+    make_napi_error("sdk_usage", None, message)
+}
+
+// ---- Retry helpers (policy shared with the Python binding via tensorlake::retry)
+
+/// Retry `op` as an idempotent operation: transient failures up to
+/// `max_retries` times, and anything that never reached the server for the
+/// full [`tensorlake::retry::UNDELIVERED_REPLAY_BUDGET`].
+async fn retry_async_op<C, T, F, Fut>(client: C, max_retries: usize, op: F) -> Result<T, SdkError>
+where
+    C: Clone,
+    F: Fn(C) -> Fut,
+    Fut: Future<Output = Result<T, SdkError>>,
+{
+    retry(client, RetryPolicy::idempotent(max_retries), op).await
+}
+
+/// Replay `op` only while its failures provably never reached the server — a
+/// connect failure, or the Sandbox Proxy reporting it could not complete the
+/// lookup. Safe for operations that must not run twice.
+async fn replay_if_never_delivered<C, T, F, Fut>(client: C, op: F) -> Result<T, SdkError>
+where
+    C: Clone,
+    F: Fn(C) -> Fut,
+    Fut: Future<Output = Result<T, SdkError>>,
+{
+    retry(client, RetryPolicy::non_idempotent(), op).await
+}
+
+/// Run `op` with bounded retries, mapping any terminal error to a napi error.
+pub(crate) async fn with_retry<C, T, F, Fut>(
+    client: C,
+    max_retries: usize,
+    op: F,
+) -> napi::Result<T>
+where
+    C: Clone,
+    F: Fn(C) -> Fut,
+    Fut: Future<Output = Result<T, SdkError>>,
+{
+    retry_async_op(client, max_retries, op)
+        .await
+        .map_err(into_napi_error)
+}
+
+// ---- Misc helpers (ported from the Python binding) ------------------------
+
+pub(crate) fn duration_from_seconds(name: &str, seconds: f64) -> napi::Result<Duration> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(usage_error(format!(
+            "{name} must be a positive finite number"
+        )));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+/// Like [`duration_from_seconds`] but accepts zero: a zero wait budget is a
+/// single non-blocking observation of the sandbox state.
+fn duration_from_non_negative_seconds(name: &str, seconds: f64) -> napi::Result<Duration> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(usage_error(format!(
+            "{name} must be a non-negative finite number"
+        )));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn parse_json_payload<T: DeserializeOwned>(request_json: &str) -> napi::Result<T> {
+    serde_json::from_str(request_json)
+        .map_err(|error| usage_error(format!("invalid JSON payload: {error}")))
+}
+
+fn is_localhost_api_url(api_url: &str) -> bool {
+    reqwest::Url::parse(api_url)
+        .ok()
+        .and_then(|url| url.host_str().map(ToString::to_string))
+        .is_some_and(|host| host == "localhost" || host == "127.0.0.1")
+}
+
+fn resolve_sandbox_lifecycle_url(api_url: &str) -> String {
+    // Single source of truth, including the TENSORLAKE_SANDBOX_API_URL
+    // override, lives in the cloud SDK crate.
+    tensorlake::resolve_sandbox_lifecycle_url(api_url)
+}
+
+fn parse_archived_sandboxes_params(
+    limit: Option<u32>,
+    cursor: Option<String>,
+    direction: Option<String>,
+) -> napi::Result<ListArchivedSandboxesParams> {
+    let direction = match direction.as_deref() {
+        None => None,
+        Some("forward") => Some(ArchivedSandboxesPaginationDirection::Forward),
+        Some("backward") => Some(ArchivedSandboxesPaginationDirection::Backward),
+        Some(other) => {
+            return Err(usage_error(format!(
+                "invalid direction '{other}': expected 'forward' or 'backward'"
+            )));
+        }
+    };
+    Ok(ListArchivedSandboxesParams {
+        limit: limit.map(|l| l as usize),
+        cursor,
+        direction,
+    })
+}
+
+fn parse_snapshot_type(snapshot_type: Option<String>) -> napi::Result<Option<SnapshotType>> {
+    match snapshot_type.as_deref() {
+        None => Ok(None),
+        Some("memory") => Ok(Some(SnapshotType::Memory)),
+        Some("filesystem") => Ok(Some(SnapshotType::Filesystem)),
+        Some(other) => Err(usage_error(format!(
+            "invalid snapshot_type '{other}': expected 'memory' or 'filesystem'"
+        ))),
+    }
+}
+
+// ---- Deferred HTTP transport ----------------------------------------------
+
+/// Constructors only retain configuration. The first async operation builds
+/// the transport on Tokio's blocking pool; concurrent first users share one
+/// initialization, and an initialization error can be retried on a later call.
+#[derive(Clone)]
+pub(crate) struct DeferredHttpClient(Arc<DeferredHttpClientInner>);
+
+struct DeferredHttpClientInner {
+    builder: ClientBuilder,
+    client: OnceCell<tensorlake::Client>,
+}
+
+impl DeferredHttpClient {
+    pub(crate) fn new(builder: ClientBuilder) -> Self {
+        Self(Arc::new(DeferredHttpClientInner {
+            builder,
+            client: OnceCell::new(),
+        }))
+    }
+
+    pub(crate) async fn get(&self) -> napi::Result<tensorlake::Client> {
+        let client = self
+            .0
+            .client
+            .get_or_try_init(|| async {
+                let builder = self.0.builder.clone();
+                tokio::task::spawn_blocking(move || builder.build())
+                    .await
+                    .map_err(|error| {
+                        napi::Error::from_reason(format!(
+                            "HTTP client initialization failed: {error}"
+                        ))
+                    })?
+                    .map_err(into_napi_error)
+            })
+            .await?;
+        Ok(client.clone())
+    }
+}
+
+// ---- Sandbox lifecycle client ---------------------------------------------
+
+/// Sandbox lifecycle, pool, and snapshot client. Owns the `reqwest`
+/// connection pool; proxy clients minted via [`connect_proxy`] share it so
+/// HTTP/2 connections are coalesced across every sandbox in a session.
+#[napi]
+pub struct NativeSandboxClient {
+    client: DeferredHttpClient,
+    api_url: String,
+    namespace: String,
+}
+
+impl NativeSandboxClient {
+    async fn client(&self) -> napi::Result<SandboxesClient> {
+        let client = self.client.get().await?;
+        let log_client = client.with_base_url(&self.api_url);
+        // A TENSORLAKE_SANDBOX_API_URL override names a sandbox proxy, which
+        // takes the flat cloud paths even when the API URL is a local server.
+        let use_namespaced_endpoints =
+            tensorlake::sandbox_api_url_override().is_none() && is_localhost_api_url(&self.api_url);
+        Ok(
+            SandboxesClient::new(client, self.namespace.clone(), use_namespaced_endpoints)
+                .with_log_client(log_client),
+        )
+    }
+}
+
+#[napi]
+impl NativeSandboxClient {
+    #[napi(constructor)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        api_url: String,
+        api_key: Option<String>,
+        organization_id: Option<String>,
+        project_id: Option<String>,
+        namespace: Option<String>,
+        user_agent: Option<String>,
+        request_timeout_sec: Option<f64>,
+    ) -> napi::Result<Self> {
+        let lifecycle_url = resolve_sandbox_lifecycle_url(&api_url);
+        let mut lifecycle_builder = ClientBuilder::new(&lifecycle_url);
+        if let Some(token) = api_key.as_deref() {
+            lifecycle_builder = lifecycle_builder.bearer_token(token);
+        }
+        if let (Some(org_id), Some(project_id)) =
+            (organization_id.as_deref(), project_id.as_deref())
+        {
+            lifecycle_builder = lifecycle_builder.scope(org_id, project_id);
+        }
+        if let Some(ua) = user_agent.as_deref() {
+            lifecycle_builder = lifecycle_builder.user_agent(ua);
+        }
+        if let Some(seconds) = request_timeout_sec {
+            let timeout = duration_from_seconds("request_timeout_sec", seconds)?;
+            lifecycle_builder = lifecycle_builder.timeout(timeout);
+        }
+
+        Ok(Self {
+            client: DeferredHttpClient::new(lifecycle_builder),
+            api_url,
+            namespace: namespace.unwrap_or_else(|| "default".to_string()),
+        })
+    }
+
+    #[napi]
+    pub fn select_sandbox_proxy_url(
+        &self,
+        sandbox_id: String,
+        sandbox_url: Option<String>,
+        ingress_endpoint: Option<String>,
+        explicit_proxy_url: Option<String>,
+    ) -> napi::Result<String> {
+        select_sandbox_proxy_url(
+            &self.api_url,
+            &sandbox_id,
+            sandbox_url.as_deref(),
+            ingress_endpoint.as_deref(),
+            explicit_proxy_url.as_deref(),
+        )
+        .map_err(into_napi_error)
+    }
+
+    /// Create a proxy client for `sandbox_id` that shares this client's
+    /// connection pool and deferred initialization. Requests reuse pooled
+    /// connections when the transport can serve the target from that pool.
+    #[napi]
+    pub fn connect_proxy(
+        &self,
+        proxy_url: String,
+        sandbox_id: String,
+        routing_hint: Option<String>,
+        request_timeout_sec: Option<f64>,
+    ) -> napi::Result<NativeSandboxProxyClient> {
+        let target =
+            resolve_sandbox_proxy_target(&proxy_url, &sandbox_id).map_err(into_napi_error)?;
+        let timeout = request_timeout_sec
+            .map(|seconds| duration_from_seconds("request_timeout_sec", seconds))
+            .transpose()?;
+        Ok(NativeSandboxProxyClient {
+            client: self.client.clone(),
+            target,
+            routing_hint,
+            timeout,
+        })
+    }
+
+    #[napi]
+    pub async fn create_sandbox(&self, request_json: String) -> napi::Result<TracedJson> {
+        let request: CreateSandboxRequest = parse_json_payload(&request_json)?;
+        // Creating a sandbox is not idempotent, so only failures that provably
+        // never reached the server are replayed.
+        let traced = replay_if_never_delivered(self.client().await?, |client| {
+            let request = request.clone();
+            async move { client.create(&request).await }
+        })
+        .await
+        .map_err(into_napi_error)?;
+        let json =
+            serde_json::to_string(&*traced).map_err(|e| into_napi_error(SdkError::from(e)))?;
+        Ok(TracedJson {
+            trace_id: traced.trace_id.clone(),
+            json,
+        })
+    }
+
+    /// Blocking create for create-and-connect: resolves with the server's
+    /// `running`, `failed` or `timeout` record, each with the sandbox id.
+    /// Replays only failures that provably never reached the server.
+    #[napi]
+    pub async fn create_sandbox_and_wait(&self, request_json: String) -> napi::Result<TracedJson> {
+        let request: CreateSandboxRequest = parse_json_payload(&request_json)?;
+        let traced = replay_if_never_delivered(self.client().await?, |client| {
+            let request = request.clone();
+            async move { client.create_and_wait(&request).await }
+        })
+        .await
+        .map_err(into_napi_error)?;
+        let json =
+            serde_json::to_string(&*traced).map_err(|e| into_napi_error(SdkError::from(e)))?;
+        Ok(TracedJson {
+            trace_id: traced.trace_id.clone(),
+            json,
+        })
+    }
+
+    /// Wait-free create (ADR 0086): sends `wait: false` and returns the
+    /// acknowledgement as soon as the sandbox is durable. Like the blocking
+    /// create it is not idempotent, so only failures that provably never
+    /// reached the server are replayed.
+    #[napi]
+    pub async fn create_sandbox_no_wait(&self, request_json: String) -> napi::Result<TracedJson> {
+        let request: CreateSandboxRequest = parse_json_payload(&request_json)?;
+        let traced = replay_if_never_delivered(self.client().await?, |client| {
+            let request = request.clone();
+            async move { client.create_no_wait(&request).await }
+        })
+        .await
+        .map_err(into_napi_error)?;
+        let json =
+            serde_json::to_string(&*traced).map_err(|e| into_napi_error(SdkError::from(e)))?;
+        Ok(TracedJson {
+            trace_id: traced.trace_id.clone(),
+            json,
+        })
+    }
+
+    /// Poll the sandbox every `poll_interval_sec` until it leaves `pending`
+    /// or `timeout_sec` elapses (ADR 0086), resolving with the last observed
+    /// `SandboxInfo`. A still-pending result means the budget ran out while
+    /// the sandbox kept its place in the queue; nothing here deletes it.
+    #[napi]
+    pub async fn wait_for_sandbox(
+        &self,
+        sandbox_id: String,
+        timeout_sec: f64,
+        poll_interval_sec: Option<f64>,
+    ) -> napi::Result<TracedJson> {
+        let timeout = duration_from_non_negative_seconds("timeout_sec", timeout_sec)?;
+        let poll_interval = poll_interval_sec
+            .map(|seconds| duration_from_seconds("poll_interval_sec", seconds))
+            .transpose()?
+            .unwrap_or(DEFAULT_WAIT_POLL_INTERVAL);
+        let client = self.client().await?;
+        let traced = client
+            .wait_until_settled(&sandbox_id, timeout, poll_interval)
+            .await
+            .map_err(into_napi_error)?;
+        let json =
+            serde_json::to_string(&*traced).map_err(|e| into_napi_error(SdkError::from(e)))?;
+        Ok(TracedJson {
+            trace_id: traced.trace_id.clone(),
+            json,
+        })
+    }
+
+    #[napi]
+    pub async fn claim_sandbox(
+        &self,
+        pool_id: String,
+        request_json: Option<String>,
+    ) -> napi::Result<TracedJson> {
+        let client = self.client().await?;
+        let request = request_json
+            .as_deref()
+            .map(parse_json_payload::<ClaimSandboxRequest>)
+            .transpose()?;
+        let traced = match request {
+            Some(request) => client.claim_with_request(&pool_id, &request).await,
+            None => client.claim(&pool_id).await,
+        }
+        .map_err(into_napi_error)?;
+        let json =
+            serde_json::to_string(&*traced).map_err(|e| into_napi_error(SdkError::from(e)))?;
+        Ok(TracedJson {
+            trace_id: traced.trace_id.clone(),
+            json,
+        })
+    }
+
+    #[napi]
+    pub async fn copy_sandbox(&self, sandbox_id: String, times: u32) -> napi::Result<TracedJson> {
+        let client = self.client().await?;
+        let traced = client
+            .copy(&sandbox_id, times as usize)
+            .await
+            .map_err(into_napi_error)?;
+        let json =
+            serde_json::to_string(&*traced).map_err(|e| into_napi_error(SdkError::from(e)))?;
+        Ok(TracedJson {
+            trace_id: traced.trace_id.clone(),
+            json,
+        })
+    }
+
+    #[napi]
+    pub async fn get_sandbox(&self, sandbox_id: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            async move {
+                let traced = c.get(&sandbox_id).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn list_sandboxes(&self) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| async move {
+            let traced = c.list().await?;
+            let trace_id = traced.trace_id.clone();
+            let json = serde_json::to_string(&serde_json::json!({ "sandboxes": *traced }))?;
+            Ok(TracedJson { trace_id, json })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn list_archived_sandboxes(
+        &self,
+        limit: Option<u32>,
+        cursor: Option<String>,
+        direction: Option<String>,
+    ) -> napi::Result<TracedJson> {
+        let params = parse_archived_sandboxes_params(limit, cursor, direction)?;
+        with_retry(self.client().await?, 5, move |c| {
+            let params = params.clone();
+            async move {
+                let traced = c.list_archived(&params).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn get_archived_sandbox(&self, sandbox_id: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            async move {
+                let traced = c.get_archived(&sandbox_id).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn get_sandbox_logs(&self, request_json: String) -> napi::Result<TracedJson> {
+        let request: GetSandboxLogsRequest = parse_json_payload(&request_json)?;
+        with_retry(self.client().await?, 5, move |c| {
+            let request = request.clone();
+            async move {
+                let traced = c.get_logs(&request).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn list_sandbox_log_processes(&self, sandbox_id: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            async move {
+                let traced = c.list_log_processes(&sandbox_id).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn update_sandbox(
+        &self,
+        sandbox_id: String,
+        request_json: String,
+        wait: Option<bool>,
+        timeout_sec: Option<f64>,
+        poll_interval_sec: Option<f64>,
+    ) -> napi::Result<TracedJson> {
+        let request: UpdateSandboxRequest = parse_json_payload(&request_json)?;
+        let options = resize_options(wait, timeout_sec, poll_interval_sec)?;
+        if request.resources.is_some() {
+            let traced = self
+                .client()
+                .await?
+                .update_with_options(&sandbox_id, &request, options)
+                .await
+                .map_err(into_napi_error)?;
+            return Ok(TracedJson {
+                trace_id: traced.trace_id.clone(),
+                json: serde_json::to_string(&*traced).map_err(|e| into_napi_error(e.into()))?,
+            });
+        }
+        with_retry(self.client().await?, 5, move |c| {
+            let id = sandbox_id.clone();
+            let request = request.clone();
+            async move {
+                let traced = c.update(&id, &request).await?;
+                Ok(TracedJson {
+                    trace_id: traced.trace_id.clone(),
+                    json: serde_json::to_string(&*traced)?,
+                })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn wait_for_resource_resize(
+        &self,
+        sandbox_id: String,
+        generation: f64,
+        timeout_sec: Option<f64>,
+        poll_interval_sec: Option<f64>,
+    ) -> napi::Result<TracedJson> {
+        if !generation.is_finite()
+            || generation < 1.0
+            || generation.fract() != 0.0
+            || generation > 9_007_199_254_740_991.0
+        {
+            return Err(usage_error(
+                "generation must be a positive safe integer".into(),
+            ));
+        }
+        let options = resize_options(Some(true), timeout_sec, poll_interval_sec)?;
+        let traced = self
+            .client()
+            .await?
+            .wait_for_resource_resize(
+                &sandbox_id,
+                generation as u64,
+                options.timeout,
+                options.poll_interval,
+            )
+            .await
+            .map_err(into_napi_error)?;
+        Ok(TracedJson {
+            trace_id: traced.trace_id.clone(),
+            json: serde_json::to_string(&*traced).map_err(|e| into_napi_error(e.into()))?,
+        })
+    }
+
+    #[napi]
+    pub async fn delete_sandbox(&self, sandbox_id: String) -> napi::Result<String> {
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            async move { c.delete(&sandbox_id).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn suspend_sandbox(&self, sandbox_id: String) -> napi::Result<String> {
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            async move { c.suspend(&sandbox_id).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn resume_sandbox(&self, sandbox_id: String) -> napi::Result<String> {
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            async move { c.resume(&sandbox_id).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    /// Suspend that waits on the server for up to `wait_sec`. Resolves `true`
+    /// when the server answered that the sandbox is suspended and `false`
+    /// when the wait ran out first.
+    #[napi]
+    pub async fn suspend_sandbox_and_wait(
+        &self,
+        sandbox_id: String,
+        wait_sec: f64,
+    ) -> napi::Result<bool> {
+        let wait = duration_from_non_negative_seconds("wait_sec", wait_sec)?;
+        // Retries share one budget, so a retried wait never runs past it.
+        let deadline = Instant::now() + wait;
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            let wait = deadline.saturating_duration_since(Instant::now());
+            async move { c.suspend_and_wait(&sandbox_id, wait).await.map(|t| *t) }
+        })
+        .await
+    }
+
+    /// Resume that waits on the server for up to `wait_sec`. Resolves `true`
+    /// when the server answered that the sandbox is running and `false` when
+    /// the wait ran out first.
+    #[napi]
+    pub async fn resume_sandbox_and_wait(
+        &self,
+        sandbox_id: String,
+        wait_sec: f64,
+    ) -> napi::Result<bool> {
+        let wait = duration_from_non_negative_seconds("wait_sec", wait_sec)?;
+        // Retries share one budget, so a retried wait never runs past it.
+        let deadline = Instant::now() + wait;
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            let wait = deadline.saturating_duration_since(Instant::now());
+            async move { c.resume_and_wait(&sandbox_id, wait).await.map(|t| *t) }
+        })
+        .await
+    }
+
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn attach_file_system(
+        &self,
+        sandbox_id: String,
+        file_system_id: String,
+        mount_path: String,
+        read_only: Option<bool>,
+        prefetch: Option<bool>,
+        snapshot_id: Option<String>,
+        owner: Option<String>,
+    ) -> napi::Result<TracedJson> {
+        let read_only = read_only.unwrap_or(false);
+        let prefetch = prefetch.unwrap_or(false);
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            let file_system_id = file_system_id.clone();
+            let mount_path = mount_path.clone();
+            let snapshot_id = snapshot_id.clone();
+            let owner = owner.clone();
+            async move {
+                let traced = c
+                    .attach_file_system(
+                        &sandbox_id,
+                        &file_system_id,
+                        &mount_path,
+                        read_only,
+                        prefetch,
+                        snapshot_id.as_deref(),
+                        owner.as_deref(),
+                    )
+                    .await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn detach_file_system(
+        &self,
+        sandbox_id: String,
+        mount_path: String,
+    ) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            let mount_path = mount_path.clone();
+            async move {
+                let traced = c.detach_file_system(&sandbox_id, &mount_path).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn create_snapshot(
+        &self,
+        sandbox_id: String,
+        snapshot_type: Option<String>,
+    ) -> napi::Result<TracedJson> {
+        let parsed_type = parse_snapshot_type(snapshot_type)?;
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            async move {
+                let traced = c.snapshot(&sandbox_id, parsed_type).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn get_snapshot(&self, snapshot_id: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let snapshot_id = snapshot_id.clone();
+            async move {
+                let traced = c.get_snapshot(&snapshot_id).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn list_snapshots(&self) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| async move {
+            let traced = c.list_snapshots().await?;
+            let trace_id = traced.trace_id.clone();
+            let json = serde_json::to_string(&serde_json::json!({ "snapshots": *traced }))?;
+            Ok(TracedJson { trace_id, json })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn list_sandbox_snapshots(&self, sandbox_id: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let sandbox_id = sandbox_id.clone();
+            async move {
+                let traced = c.list_sandbox_snapshots(&sandbox_id).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&serde_json::json!({ "snapshots": *traced }))?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn delete_snapshot(&self, snapshot_id: String) -> napi::Result<String> {
+        with_retry(self.client().await?, 5, move |c| {
+            let snapshot_id = snapshot_id.clone();
+            async move { c.delete_snapshot(&snapshot_id).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn create_pool(&self, request_json: String) -> napi::Result<TracedJson> {
+        let request: CreateSandboxPoolRequest = parse_json_payload(&request_json)?;
+        with_retry(self.client().await?, 5, move |c| {
+            let request = request.clone();
+            async move {
+                let traced = c.create_pool_with_network(&request).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn get_pool(&self, pool_id: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let pool_id = pool_id.clone();
+            async move {
+                let traced = c.get_pool(&pool_id).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn list_pools(&self) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| async move {
+            let traced = c.list_pools().await?;
+            let trace_id = traced.trace_id.clone();
+            let json = serde_json::to_string(&serde_json::json!({ "pools": *traced }))?;
+            Ok(TracedJson { trace_id, json })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn update_pool(
+        &self,
+        pool_id: String,
+        request_json: String,
+    ) -> napi::Result<TracedJson> {
+        let request: UpdateSandboxPoolRequest = parse_json_payload(&request_json)?;
+        with_retry(self.client().await?, 5, move |c| {
+            let pool_id = pool_id.clone();
+            let request = request.clone();
+            async move {
+                let traced = c.update_pool_with_network(&pool_id, &request).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn delete_pool(&self, pool_id: String) -> napi::Result<String> {
+        with_retry(self.client().await?, 5, move |c| {
+            let pool_id = pool_id.clone();
+            async move { c.delete_pool(&pool_id).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+}
+
+/// A stream owns its cancellation state; JS receives only a cancellation
+/// function and the result Promise, never a borrowed native control object.
+#[napi(object, object_from_js = false)]
+pub struct NativeStreamCall {
+    #[napi(ts_type = "Promise<string>")]
+    pub result: JsObject,
+    pub cancel: JsFunction,
+}
+
+async fn cancellable_stream(
+    control: tokio::sync::watch::Sender<bool>,
+    operation: impl Future<Output = napi::Result<String>>,
+) -> napi::Result<String> {
+    let mut cancelled = control.subscribe();
+    tokio::select! {
+        biased;
+        _ = cancelled.wait_for(|value| *value) => Ok(String::new()),
+        result = operation => result,
+    }
+}
+
+// ---- Sandbox proxy client -------------------------------------------------
+
+/// Process / file / PTY client for a single running sandbox. Prefer
+/// [`NativeSandboxClient::connect_proxy`] (shared pool) over the direct
+/// constructor.
+#[napi]
+#[derive(Clone)]
+pub struct NativeSandboxProxyClient {
+    client: DeferredHttpClient,
+    target: SandboxProxyTarget,
+    routing_hint: Option<String>,
+    timeout: Option<Duration>,
+}
+
+impl NativeSandboxProxyClient {
+    fn spawn_stream<F, Fut>(&self, env: Env, operation: F) -> napi::Result<NativeStreamCall>
+    where
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: Future<Output = napi::Result<String>> + Send + 'static,
+    {
+        // Clone the client synchronously before spawning or parsing payloads.
+        // Cancellation state never crosses into JS as a native class pointer.
+        // Both the future and the cancellation function own a sender, so GC of
+        // either JS wrapper cannot free the state or close an active stream.
+        let client = self.clone();
+        let control = tokio::sync::watch::channel(false).0;
+        let signal = control.clone();
+        let cancel = env.create_function_from_closure("cancel", move |_| {
+            signal.send_replace(true);
+            Ok(())
+        })?;
+        let result =
+            env.spawn_future(async move { cancellable_stream(control, operation(client)).await })?;
+        Ok(NativeStreamCall { result, cancel })
+    }
+
+    async fn client(&self) -> napi::Result<SandboxProxyClient> {
+        let client = self
+            .client
+            .get()
+            .await?
+            .with_base_url_and_timeout(&self.target.base_url, self.timeout)
+            .map_err(into_napi_error)?;
+        Ok(
+            SandboxProxyClient::new(client, self.target.host_override.clone())
+                .with_sandbox_id(self.target.sandbox_id_header.clone())
+                .with_routing_hint(self.routing_hint.clone()),
+        )
+    }
+}
+
+#[napi]
+impl NativeSandboxProxyClient {
+    #[napi(constructor)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        proxy_url: String,
+        sandbox_id: String,
+        api_key: Option<String>,
+        organization_id: Option<String>,
+        project_id: Option<String>,
+        routing_hint: Option<String>,
+        user_agent: Option<String>,
+        request_timeout_sec: Option<f64>,
+    ) -> napi::Result<Self> {
+        let target =
+            resolve_sandbox_proxy_target(&proxy_url, &sandbox_id).map_err(into_napi_error)?;
+
+        let mut builder = ClientBuilder::new(&target.base_url);
+        if let Some(token) = api_key.as_deref() {
+            builder = builder.bearer_token(token);
+        }
+        if let (Some(org_id), Some(project_id)) =
+            (organization_id.as_deref(), project_id.as_deref())
+        {
+            builder = builder.scope(org_id, project_id);
+        }
+        if let Some(ua) = user_agent.as_deref() {
+            builder = builder.user_agent(ua);
+        }
+        let timeout = request_timeout_sec
+            .map(|seconds| duration_from_seconds("request_timeout_sec", seconds))
+            .transpose()?;
+        Ok(Self {
+            client: DeferredHttpClient::new(builder),
+            target,
+            routing_hint,
+            timeout,
+        })
+    }
+
+    #[napi]
+    pub fn base_url(&self) -> String {
+        self.target.base_url.clone()
+    }
+
+    // -- Process management --
+
+    #[napi]
+    pub async fn start_process(&self, payload_json: String) -> napi::Result<TracedJson> {
+        let payload: Value = parse_json_payload(&payload_json)?;
+        with_retry(self.client().await?, 5, move |c| {
+            let payload = payload.clone();
+            async move {
+                let traced = c.start_process(&payload).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn list_processes(&self) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| async move {
+            let traced = c.list_processes().await?;
+            let trace_id = traced.trace_id.clone();
+            let processes = traced.into_inner();
+            let json = serde_json::to_string(&serde_json::json!({ "processes": processes }))?;
+            Ok(TracedJson { trace_id, json })
+        })
+        .await
+    }
+
+    // `process` is the pid-or-name path segment (the TS layer stringifies). Cloned per retry
+    // attempt because `with_retry` may invoke the closure more than once.
+    #[napi]
+    pub async fn get_process(&self, process: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let process = process.clone();
+            async move {
+                let traced = c.get_process(process).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn kill_process(&self, process: String) -> napi::Result<String> {
+        with_retry(self.client().await?, 5, move |c| {
+            let process = process.clone();
+            async move { c.kill_process(process).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn restart_process(&self, process: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let process = process.clone();
+            async move {
+                let traced = c.restart_process(process).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn send_signal(&self, process: String, signal: i32) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let process = process.clone();
+            async move {
+                let traced = c.send_signal(process, signal as i64).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn write_stdin(&self, process: String, data: Buffer) -> napi::Result<String> {
+        let bytes = data.to_vec();
+        with_retry(self.client().await?, 5, move |c| {
+            let process = process.clone();
+            let bytes = bytes.clone();
+            async move { c.write_stdin(process, bytes).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn close_stdin(&self, process: String) -> napi::Result<String> {
+        with_retry(self.client().await?, 5, move |c| {
+            let process = process.clone();
+            async move { c.close_stdin(process).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn get_stdout(&self, process: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let process = process.clone();
+            async move {
+                let traced = c.get_stdout(process).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn get_stderr(&self, process: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let process = process.clone();
+            async move {
+                let traced = c.get_stderr(process).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn get_output(&self, process: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let process = process.clone();
+            async move {
+                let traced = c.get_output(process).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    // -- Streaming output (events delivered live via `emit`) --
+
+    #[napi]
+    pub fn follow_stdout(
+        &self,
+        env: Env,
+        process: String,
+        emit: ThreadsafeFunction<String, ErrorStrategy::Fatal>,
+    ) -> napi::Result<NativeStreamCall> {
+        self.spawn_stream(env, |client| async move {
+            client
+                .client()
+                .await?
+                .follow_stdout_streaming_async(process, move |event| {
+                    emit_event(emit.clone(), event)
+                })
+                .await
+                .map_err(into_napi_error)
+        })
+    }
+
+    #[napi]
+    pub fn follow_stderr(
+        &self,
+        env: Env,
+        process: String,
+        emit: ThreadsafeFunction<String, ErrorStrategy::Fatal>,
+    ) -> napi::Result<NativeStreamCall> {
+        self.spawn_stream(env, |client| async move {
+            client
+                .client()
+                .await?
+                .follow_stderr_streaming_async(process, move |event| {
+                    emit_event(emit.clone(), event)
+                })
+                .await
+                .map_err(into_napi_error)
+        })
+    }
+
+    #[napi]
+    pub fn follow_output(
+        &self,
+        env: Env,
+        process: String,
+        emit: ThreadsafeFunction<String, ErrorStrategy::Fatal>,
+    ) -> napi::Result<NativeStreamCall> {
+        self.spawn_stream(env, |client| async move {
+            client
+                .client()
+                .await?
+                .follow_output_streaming_async(process, move |event| {
+                    emit_event(emit.clone(), event)
+                })
+                .await
+                .map_err(into_napi_error)
+        })
+    }
+
+    /// Start a process and stream lifecycle events live via `emit`. Resolves
+    /// with the trace id once the process exits.
+    #[napi]
+    pub fn run_process_streaming(
+        &self,
+        env: Env,
+        payload_json: String,
+        emit: ThreadsafeFunction<String, ErrorStrategy::Fatal>,
+    ) -> napi::Result<NativeStreamCall> {
+        self.spawn_stream(env, |client| async move {
+            let payload: Value = parse_json_payload(&payload_json)?;
+            client
+                .client()
+                .await?
+                .run_process_streaming_async(&payload, move |event| emit_event(emit.clone(), event))
+                .await
+                .map_err(into_napi_error)
+        })
+    }
+
+    /// Start a process and buffer all lifecycle events, returning them once the
+    /// process exits. Convenience for `run()`-style "to completion" callers.
+    #[napi]
+    pub async fn run_process(&self, payload_json: String) -> napi::Result<TracedEvents> {
+        let payload: Value = parse_json_payload(&payload_json)?;
+        // Running a process is not idempotent, so this is not wrapped in the
+        // general retry. Failures that never reached the sandbox — a connect
+        // failure, or the Sandbox Proxy giving up before forwarding — are still
+        // replayed: no process was started.
+        let traced = replay_if_never_delivered(self.client().await?, |client| {
+            let payload = payload.clone();
+            async move { client.run_process(&payload).await }
+        })
+        .await
+        .map_err(into_napi_error)?;
+        let trace_id = traced.trace_id.clone();
+        let events = traced
+            .into_inner()
+            .into_iter()
+            .map(|event| serde_json::to_string(&event))
+            .collect::<Result<Vec<String>, serde_json::Error>>()
+            .map_err(|e| into_napi_error(SdkError::from(e)))?;
+        Ok(TracedEvents { trace_id, events })
+    }
+
+    // -- File operations --
+
+    #[napi]
+    pub async fn read_file(&self, path: String) -> napi::Result<TracedBytes> {
+        let (trace_id, data): (String, Vec<u8>) = with_retry(self.client().await?, 5, move |c| {
+            let path = path.clone();
+            async move {
+                let traced = c.read_file(&path).await?;
+                Ok((traced.trace_id.clone(), traced.into_inner()))
+            }
+        })
+        .await?;
+        Ok(TracedBytes {
+            trace_id,
+            data: data.into(),
+            content_id: None,
+            full_size: None,
+        })
+    }
+
+    #[napi]
+    pub async fn write_file(&self, path: String, content: Buffer) -> napi::Result<String> {
+        let bytes = content.to_vec();
+        with_retry(self.client().await?, 5, move |c| {
+            let path = path.clone();
+            let bytes = bytes.clone();
+            async move { c.write_file(&path, bytes).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn upload_file(&self, path: String, local_path: String) -> napi::Result<String> {
+        with_retry(self.client().await?, 5, move |c| {
+            let path = path.clone();
+            let local_path = local_path.clone();
+            async move { c.upload_file(&path, local_path).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn delete_file(&self, path: String) -> napi::Result<String> {
+        with_retry(self.client().await?, 5, move |c| {
+            let path = path.clone();
+            async move { c.delete_file(&path).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn list_directory(&self, path: String) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| {
+            let path = path.clone();
+            async move {
+                let traced = c.list_directory(&path).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    // -- PTY + system --
+
+    #[napi]
+    pub async fn create_pty_session(&self, payload_json: String) -> napi::Result<TracedJson> {
+        let payload: Value = parse_json_payload(&payload_json)?;
+        with_retry(self.client().await?, 5, move |c| {
+            let payload = payload.clone();
+            async move {
+                let traced = c.create_pty_session(&payload).await?;
+                let trace_id = traced.trace_id.clone();
+                let json = serde_json::to_string(&*traced)?;
+                Ok(TracedJson { trace_id, json })
+            }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn delete_pty_session(&self, session_id: String) -> napi::Result<String> {
+        with_retry(self.client().await?, 5, move |c| {
+            let session_id = session_id.clone();
+            async move { c.delete_pty_session(&session_id).await.map(|t| t.trace_id) }
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn health(&self) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| async move {
+            let traced = c.health().await?;
+            let trace_id = traced.trace_id.clone();
+            let json = serde_json::to_string(&*traced)?;
+            Ok(TracedJson { trace_id, json })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn info(&self) -> napi::Result<TracedJson> {
+        with_retry(self.client().await?, 5, move |c| async move {
+            let traced = c.info().await?;
+            let trace_id = traced.trace_id.clone();
+            let json = serde_json::to_string(&*traced)?;
+            Ok(TracedJson { trace_id, json })
+        })
+        .await
+    }
+}
+
+/// Validate a managed-process name client-side; throws on failure. Wraps the single
+/// source-of-truth rule in the Rust cloud SDK so the TS layer need not reimplement it.
+#[napi]
+#[allow(dead_code)]
+pub fn validate_managed_name(name: String) -> napi::Result<()> {
+    tensorlake::sandboxes::validate_managed_name(&name).map_err(into_napi_error)
+}
+
+/// Await the JS consumer's acknowledgement. Rust stops polling the response
+/// while the worker/main-thread bridge has an outstanding event.
+async fn emit_event<E: serde::Serialize>(
+    emit: ThreadsafeFunction<String, ErrorStrategy::Fatal>,
+    event: E,
+) -> Result<(), SdkError> {
+    let serialized = serde_json::to_string(&event)?;
+    let ack: Either<(), Promise<()>> = emit
+        .call_async(serialized)
+        .await
+        .map_err(|error| SdkError::ClientError(error.to_string()))?;
+    match ack {
+        Either::A(()) => Ok(()),
+        Either::B(promise) => promise
+            .await
+            .map_err(|error| SdkError::ClientError(error.to_string())),
+    }
+}
+
+fn resize_options(
+    wait: Option<bool>,
+    timeout: Option<f64>,
+    poll: Option<f64>,
+) -> napi::Result<ResizeOptions> {
+    let timeout = timeout.unwrap_or(300.0);
+    let poll = poll.unwrap_or(1.0);
+    if !timeout.is_finite() || timeout < 0.0 || !poll.is_finite() || poll <= 0.0 {
+        return Err(usage_error(
+            "timeout must be finite and non-negative; pollInterval must be finite and positive"
+                .into(),
+        ));
+    }
+    Ok(ResizeOptions {
+        wait: wait.unwrap_or(true),
+        timeout: std::time::Duration::try_from_secs_f64(timeout)
+            .map_err(|e| usage_error(e.to_string()))?,
+        poll_interval: std::time::Duration::try_from_secs_f64(poll)
+            .map_err(|e| usage_error(e.to_string()))?,
+    })
+}

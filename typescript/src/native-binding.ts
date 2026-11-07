@@ -1,0 +1,113 @@
+import { detectLinuxLibc } from "../lib/libc.cjs";
+import * as fs from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+interface RuntimeReport {
+  header?: {
+    glibcVersionRuntime?: string;
+  };
+}
+
+interface TargetOptions {
+  libc?: "gnu" | "musl";
+  report?: RuntimeReport;
+}
+
+interface NativeBindingPathOptions extends TargetOptions {
+  packageRoot?: string;
+  platform?: NodeJS.Platform;
+  arch?: string;
+}
+
+const NATIVE_PACKAGES: Readonly<Record<string, string>> = {
+  "darwin-arm64": "@tensorlakeai/native-darwin-arm64",
+  "linux-arm64": "@tensorlakeai/native-linux-arm64-gnu",
+  "linux-arm64-musl": "@tensorlakeai/native-linux-arm64-musl",
+  "linux-x64": "@tensorlakeai/native-linux-x64-gnu",
+  "linux-x64-musl": "@tensorlakeai/native-linux-x64-musl",
+  "win32-x64": "@tensorlakeai/native-win32-x64",
+};
+
+function packageRoot(): string {
+  const parent = fileURLToPath(new URL("../", import.meta.url));
+  if (fs.existsSync(path.join(parent, "package.json"))) return parent;
+  const grandparent = fileURLToPath(new URL("../../", import.meta.url));
+  if (fs.existsSync(path.join(grandparent, "package.json"))) return grandparent;
+  return parent;
+}
+
+let cachedLinuxLibc: "gnu" | "musl" | undefined;
+
+function linuxLibcFamily(options: TargetOptions): "gnu" | "musl" {
+  if (options.libc != null) return options.libc;
+  if (options.report != null) {
+    return options.report.header?.glibcVersionRuntime ? "gnu" : "musl";
+  }
+  if (cachedLinuxLibc != null) return cachedLinuxLibc;
+
+  cachedLinuxLibc = detectLinuxLibc(fs);
+  return cachedLinuxLibc;
+}
+
+export function nativeTargetId(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+  options: TargetOptions = {},
+): string {
+  const target = `${platform}-${arch}`;
+  if (platform !== "linux") return target;
+  if (options.libc == null && options.report == null && platform !== process.platform) {
+    return target;
+  }
+  return linuxLibcFamily(options) === "musl" ? `${target}-musl` : target;
+}
+
+export function nativeBindingPath(options: NativeBindingPathOptions = {}): string {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  return path.join(
+    options.packageRoot ?? packageRoot(),
+    "dist",
+    "native",
+    nativeTargetId(platform, arch, options),
+    "tensorlake-node.node",
+  );
+}
+
+export function nativePackageName(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+  options: TargetOptions = {},
+): string | undefined {
+  return NATIVE_PACKAGES[nativeTargetId(platform, arch, options)];
+}
+
+export function loadNative<T>(): T {
+  const target = nativeTargetId();
+  const bindingPath = nativeBindingPath();
+  const require = createRequire(import.meta.url);
+
+  // Local source builds stage the addon here. Published packages intentionally
+  // omit this directory and resolve the platform-specific optional dependency.
+  if (fs.existsSync(bindingPath)) return require(bindingPath) as T;
+
+  const packageName = nativePackageName();
+  if (!packageName) {
+    throw new Error(
+      `Tensorlake does not provide a native binding for ${target}.`,
+    );
+  }
+
+  let packageEntry: string;
+  try {
+    packageEntry = require.resolve(packageName);
+  } catch (cause) {
+    throw new Error(
+      `Missing native binding package ${packageName} for ${target}. Reinstall @tensorlakeai/tensorlake without omitting optional dependencies, and install dependencies on the machine where they will run.`,
+      { cause },
+    );
+  }
+  return require(packageEntry) as T;
+}

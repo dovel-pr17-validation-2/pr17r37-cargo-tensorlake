@@ -1,0 +1,1644 @@
+"""Async client for interacting with a running sandbox.
+
+Mirrors :class:`Sandbox` but exposes coroutine methods that await the Rust
+``*_async`` bindings directly, so each call yields control to the active
+asyncio event loop instead of blocking a worker thread.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Literal, overload
+from urllib.parse import urlparse
+
+import httpx
+
+from tensorlake._tracing import USER_AGENT, Traced, TracedIterator, inject_traceparent
+
+from . import _defaults
+from .exceptions import (
+    RemoteAPIError,
+    SandboxError,
+    SandboxNotFoundError,
+    SandboxNotRoutableError,
+    SandboxPending,
+)
+from .models import (
+    AsyncPendingSandbox,
+    CheckpointType,
+    ClearNetworkPolicy,
+    CommandResult,
+    CopySandboxResponse,
+    DaemonInfo,
+    FileSystemMount,
+    GetOrCreateOutcome,
+    GpuModel,
+    GpuRequest,
+    HealthResponse,
+    ListDirectoryResponse,
+    ListProcessesResponse,
+    NetworkConfig,
+    OutputEvent,
+    OutputMode,
+    OutputResponse,
+    ProcessHealthCheck,
+    ProcessInfo,
+    ProcessUser,
+    RestartPolicyConfig,
+    SandboxInfo,
+    SandboxLogLevel,
+    SandboxLogsResponse,
+    SandboxProcessLogFiltersResponse,
+    SandboxStatus,
+    SendSignalResponse,
+    SnapshotInfo,
+    SnapshotType,
+    SnapshotWaitCondition,
+    StdinMode,
+)
+from .sandbox import (
+    _GET_OR_CREATE_ATTEMPTS,
+    _GET_OR_CREATE_RETRY_DELAY_SEC,
+    _PROCESS_ARG_UNSET,
+    _RUST_SANDBOX_PROXY_CLIENT_AVAILABLE,
+    RustCloudSandboxProxyClient,
+    Sandbox,
+    _raise_as_sandbox_error,
+    _resolve_process_arg,
+    _validate_managed_name_client_side,
+)
+from .tunnel import DEFAULT_LOCAL_HOST, DEFAULT_TUNNEL_CONNECT_TIMEOUT, AsyncTcpTunnel
+
+if TYPE_CHECKING:
+    from .async_client import AsyncSandboxClient
+
+
+class AsyncSandbox:
+    """Async client for interacting with a running sandbox.
+
+    Use :class:`AsyncSandboxClient` to create or connect, then call methods
+    on the returned :class:`AsyncSandbox` to drive the sandbox without
+    blocking the event loop.
+
+    Direct construction requires ``proxy_url``. Prefer
+    :meth:`AsyncSandbox.connect` or :class:`AsyncSandboxClient` so the
+    server-returned sandbox URL is used.
+    """
+
+    def __init__(
+        self,
+        identifier: str | None = None,
+        proxy_url: str | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        *,
+        sandbox_id: str | None = None,
+        routing_hint: str | None = None,
+        request_timeout: float | None = None,
+        _proxy_rust_client: object | None = None,
+        _explicit_proxy_url: str | None = None,
+    ) -> None:
+        if identifier and sandbox_id and identifier != sandbox_id:
+            raise SandboxError(
+                "Provide only one of `identifier` or `sandbox_id`, not both."
+            )
+        sandbox_identifier = identifier or sandbox_id
+        if not sandbox_identifier:
+            raise SandboxError(
+                "`identifier` is required. `sandbox_id` is accepted as a deprecated alias."
+            )
+        if proxy_url is None:
+            if _proxy_rust_client is None:
+                raise SandboxError(
+                    "`proxy_url` is required for direct AsyncSandbox construction; "
+                    "use AsyncSandbox.connect(...) or AsyncSandboxClient.connect(...) to "
+                    "use the server-returned sandbox_url."
+                )
+            proxy_url = _proxy_rust_client.base_url()
+
+        self._identifier = sandbox_identifier
+        self._sandbox_id: str | None = None
+        self._bind_outcome: GetOrCreateOutcome | None = None
+        self._trace_id: str | None = None
+        self._cached_info: SandboxInfo | None = None
+        self._owns_sandbox: bool = False
+        self._lifecycle_client: "AsyncSandboxClient | None" = None
+        self._proxy_url = proxy_url
+        self._api_key = api_key
+        self._organization_id = organization_id
+        self._project_id = project_id
+        self._request_timeout = request_timeout
+        self._explicit_proxy_url = _explicit_proxy_url
+        self._set_proxy_transport(proxy_url, sandbox_identifier)
+
+        if _proxy_rust_client is not None:
+            self._rust_client = _proxy_rust_client
+            self._base_url = self._rust_client.base_url()
+        elif not _RUST_SANDBOX_PROXY_CLIENT_AVAILABLE:
+            raise SandboxError(
+                "Rust Cloud SDK sandbox proxy client is required but unavailable. "
+                "Build/install it with `make build_rust_py_client`."
+            )
+        else:
+            try:
+                kwargs = {
+                    "proxy_url": proxy_url,
+                    "sandbox_id": sandbox_identifier,
+                    "api_key": api_key,
+                    "organization_id": organization_id,
+                    "project_id": project_id,
+                    "routing_hint": routing_hint,
+                    "user_agent": USER_AGENT,
+                }
+                if request_timeout is not None:
+                    kwargs["request_timeout_sec"] = request_timeout
+                self._rust_client = RustCloudSandboxProxyClient(**kwargs)
+                self._base_url = self._rust_client.base_url()
+            except Exception as e:
+                _raise_as_sandbox_error(e)
+
+    def _set_proxy_transport(self, proxy_url: str, sandbox_identifier: str) -> None:
+        self._proxy_url = proxy_url
+        parsed_proxy = urlparse(proxy_url)
+        self._host_header = None
+        if parsed_proxy.hostname in ("localhost", "127.0.0.1"):
+            self._host_header = f"{sandbox_identifier}.local"
+        self._proxy_headers = {}
+        if self._api_key:
+            self._proxy_headers["Authorization"] = f"Bearer {self._api_key}"
+        if self._organization_id:
+            self._proxy_headers["X-Forwarded-Organization-Id"] = self._organization_id
+        if self._project_id:
+            self._proxy_headers["X-Forwarded-Project-Id"] = self._project_id
+        if self._host_header:
+            self._proxy_headers["Host"] = self._host_header
+        else:
+            self._proxy_headers["X-Tensorlake-Sandbox-Id"] = sandbox_identifier
+
+    def _rebind_proxy(self, info: SandboxInfo) -> None:
+        self._require_lifecycle_client("refresh proxy routing")
+        if info.status != SandboxStatus.RUNNING:
+            raise SandboxError(
+                f"Sandbox {info.sandbox_id!r} is {info.status.value}; cannot refresh proxy routing"
+            )
+        if info.sandbox_url is None and self._explicit_proxy_url is None:
+            raise SandboxError(
+                f"Sandbox {info.sandbox_id!r} did not include proxy routing information"
+            )
+
+        proxy_url = self._lifecycle_client._rust_client.select_sandbox_proxy_url(
+            sandbox_id=info.sandbox_id,
+            sandbox_url=info.sandbox_url,
+            ingress_endpoint=info.ingress_endpoint,
+            explicit_proxy_url=self._explicit_proxy_url,
+        )
+        connect_proxy_kwargs = {
+            "proxy_url": proxy_url,
+            "sandbox_id": info.sandbox_id,
+            "routing_hint": info.routing_hint,
+        }
+        if self._request_timeout is not None:
+            connect_proxy_kwargs["request_timeout_sec"] = self._request_timeout
+        try:
+            new_rust_client = self._lifecycle_client._rust_client.connect_proxy(
+                **connect_proxy_kwargs
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+        self._rust_client = new_rust_client
+        self._base_url = self._rust_client.base_url()
+        self._set_proxy_transport(proxy_url, info.sandbox_id)
+        self._cached_info = info
+        self._sandbox_id = info.sandbox_id
+
+    async def _fresh_running_info_for_rebind(
+        self,
+        deadline: float,
+        poll_interval: float,
+    ) -> SandboxInfo:
+        self._require_lifecycle_client("refresh proxy routing")
+        identifier = self._lifecycle_identifier()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        last: SandboxInfo | None = None
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                info = (
+                    await asyncio.wait_for(
+                        self._lifecycle_client.get(identifier), timeout=remaining
+                    )
+                ).value
+            except asyncio.TimeoutError:
+                break
+            if info.status == SandboxStatus.RUNNING and (
+                info.sandbox_url is not None or self._explicit_proxy_url is not None
+            ):
+                return info
+            if info.status == SandboxStatus.TERMINATED:
+                raise SandboxError(
+                    f"Sandbox {identifier!r} terminated while refreshing proxy routing",
+                    reason=info.termination_reason,
+                    sandbox_id=info.sandbox_id,
+                )
+            last = info
+            await asyncio.sleep(min(poll_interval, max(0.0, deadline - loop.time())))
+        if last is not None and last.status == SandboxStatus.PENDING:
+            # Still queued for capacity: it keeps its place, the caller decides.
+            raise SandboxPending(
+                last.sandbox_id,
+                pending_reason=last.pending_reason,
+                timeout=max(0.0, deadline - started),
+            )
+        raise SandboxError(
+            f"Sandbox {identifier!r} did not provide refreshed proxy routing within timeout",
+            sandbox_id=identifier,
+        )
+
+    # --- Class-level factory methods ---
+
+    @overload
+    @classmethod
+    async def create(
+        cls,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        pool_id: str | None = None,
+        snapshot_id: str | None = None,
+        proxy_url: str | None = None,
+        request_timeout: float | None = None,
+        startup_timeout: float | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        cancel_on_timeout: bool = False,
+        wait: Literal[True] = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> "AsyncSandbox": ...
+
+    @overload
+    @classmethod
+    async def create(
+        cls,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        pool_id: str | None = None,
+        snapshot_id: str | None = None,
+        proxy_url: str | None = None,
+        request_timeout: float | None = None,
+        startup_timeout: float | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        cancel_on_timeout: bool = False,
+        *,
+        wait: Literal[False],
+        auto_resume: bool | None = None,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> AsyncPendingSandbox: ...
+
+    @classmethod
+    async def create(
+        cls,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        pool_id: str | None = None,
+        snapshot_id: str | None = None,
+        proxy_url: str | None = None,
+        request_timeout: float | None = None,
+        startup_timeout: float | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        cancel_on_timeout: bool = False,
+        wait: bool = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> "AsyncSandbox | AsyncPendingSandbox":
+        """Create a new sandbox and return a connected, running handle.
+
+        Async mirror of :meth:`Sandbox.create`. With ``wait=False`` it
+        returns an :class:`AsyncPendingSandbox` at once (``await
+        pending.ready()`` waits for it). **When the wait runs out the
+        sandbox is not deleted**; ``SandboxPending`` is raised with its id
+        and it keeps its place in the queue. Pass ``cancel_on_timeout=True``
+        for the previous delete-then-raise behaviour, or
+        ``max_pending_secs`` for a server-side bound.
+        """
+        from .async_client import AsyncSandboxClient
+
+        effective_request_timeout = (
+            startup_timeout
+            if startup_timeout is not None
+            else (
+                request_timeout
+                if request_timeout is not None
+                else _defaults.DEFAULT_HTTP_TIMEOUT_SEC
+            )
+        )
+        client = AsyncSandboxClient(
+            api_url=api_url,
+            api_key=api_key,
+            organization_id=organization_id,
+            project_id=project_id,
+            namespace=namespace,
+            request_timeout=effective_request_timeout,
+            _internal=True,
+        )
+        if not wait:
+            if pool_id is not None:
+                raise SandboxError(
+                    "wait=False cannot be combined with pool_id: a pool claim is "
+                    "answered synchronously"
+                )
+            return await client._request_pending(
+                image=image,
+                cpus=cpus,
+                memory_mb=memory_mb,
+                disk_mb=disk_mb,
+                gpus=gpus,
+                gpu_model=gpu_model,
+                timeout_secs=timeout_secs,
+                entrypoint=entrypoint,
+                allow_internet_access=allow_internet_access,
+                allow_out=allow_out,
+                deny_out=deny_out,
+                snapshot_id=snapshot_id,
+                allow_unauthenticated_access=allow_unauthenticated_access,
+                exposed_ports=exposed_ports,
+                name=name,
+                file_systems=file_systems,
+                gpu=gpu,
+                max_pending_secs=max_pending_secs,
+                auto_resume=auto_resume,
+                proxy_url=proxy_url,
+                request_timeout=effective_request_timeout,
+                owns_sandbox=True,
+            )
+        return await client.create_and_connect(
+            image=image,
+            cpus=cpus,
+            memory_mb=memory_mb,
+            disk_mb=disk_mb,
+            gpus=gpus,
+            gpu_model=gpu_model,
+            timeout_secs=timeout_secs,
+            entrypoint=entrypoint,
+            allow_internet_access=allow_internet_access,
+            allow_out=allow_out,
+            deny_out=deny_out,
+            pool_id=pool_id,
+            snapshot_id=snapshot_id,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=exposed_ports,
+            proxy_url=proxy_url,
+            request_timeout=effective_request_timeout,
+            name=name,
+            file_systems=file_systems,
+            gpu=gpu,
+            max_pending_secs=max_pending_secs,
+            auto_resume=auto_resume,
+            cancel_on_timeout=cancel_on_timeout,
+        )
+
+    @classmethod
+    async def connect(
+        cls,
+        sandbox_id: str,
+        *,
+        proxy_url: str | None = None,
+        routing_hint: str | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        request_timeout: float | None = None,
+    ) -> "AsyncSandbox":
+        from .async_client import AsyncSandboxClient
+
+        client = AsyncSandboxClient(
+            api_url=api_url,
+            api_key=api_key,
+            organization_id=organization_id,
+            project_id=project_id,
+            namespace=namespace,
+            request_timeout=(
+                request_timeout
+                if request_timeout is not None
+                else _defaults.DEFAULT_HTTP_TIMEOUT_SEC
+            ),
+            _internal=True,
+        )
+        return await client.connect(
+            sandbox_id,
+            proxy_url=proxy_url,
+            routing_hint=routing_hint,
+            request_timeout=request_timeout,
+        )
+
+    @classmethod
+    async def get_or_create(
+        cls,
+        name: str,
+        *,
+        resume: bool = True,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        snapshot_id: str | None = None,
+        proxy_url: str | None = None,
+        request_timeout: float | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        auto_resume: bool | None = None,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> "AsyncSandbox":
+        """Return the one sandbox bound to ``name``. Create it on first use.
+
+        Async mirror of :meth:`Sandbox.get_or_create`; see that method for
+        the full semantics. In short: connect by name; create when the name
+        is free; on a lost create race (HTTP 409), attach to the winner;
+        wait for a still-starting sandbox to reach ``Running``; resume a
+        suspended sandbox unless ``resume=False``. The returned handle
+        records what the call did in :attr:`bind_outcome`.
+        """
+        connect_kwargs: dict[str, Any] = {
+            "proxy_url": proxy_url,
+            "api_key": api_key,
+            "api_url": api_url,
+            "organization_id": organization_id,
+            "project_id": project_id,
+            "namespace": namespace,
+            "request_timeout": request_timeout,
+        }
+        wait_timeout = (
+            request_timeout
+            if request_timeout is not None
+            else _defaults.DEFAULT_HTTP_TIMEOUT_SEC
+        )
+        last_conflict: RemoteAPIError | None = None
+        for attempt in range(_GET_OR_CREATE_ATTEMPTS):
+            if attempt:
+                # Reachable only after a lost create race whose winner is
+                # not connectable yet (for example, the name's previous
+                # holder is still terminating). Give the server a moment.
+                await asyncio.sleep(_GET_OR_CREATE_RETRY_DELAY_SEC * attempt)
+            try:
+                try:
+                    sandbox = await cls.connect(name, **connect_kwargs)
+                except SandboxNotRoutableError:
+                    # Another caller's create is still starting the sandbox,
+                    # so it has no proxy routing (sandbox_url) yet. Match
+                    # create(): wait until connect can bind to it.
+                    sandbox = await cls._connect_when_routable(
+                        name, connect_kwargs, wait_timeout
+                    )
+                    if sandbox is None:
+                        # The starting sandbox disappeared or terminated;
+                        # the name may be free again.
+                        continue
+                # With an explicit proxy_url, connect skips resolution and
+                # cannot see that the name is free; this info() call is then
+                # the existence check that routes a free name to the create
+                # step below. Otherwise connect already cached the info, so
+                # this adds no request.
+                status = (await sandbox.info()).status
+            except SandboxNotFoundError:
+                try:
+                    created = await cls.create(
+                        image=image,
+                        cpus=cpus,
+                        memory_mb=memory_mb,
+                        disk_mb=disk_mb,
+                        gpus=gpus,
+                        gpu_model=gpu_model,
+                        timeout_secs=timeout_secs,
+                        entrypoint=entrypoint,
+                        allow_internet_access=allow_internet_access,
+                        allow_out=allow_out,
+                        deny_out=deny_out,
+                        snapshot_id=snapshot_id,
+                        allow_unauthenticated_access=allow_unauthenticated_access,
+                        exposed_ports=exposed_ports,
+                        proxy_url=proxy_url,
+                        request_timeout=request_timeout,
+                        name=name,
+                        file_systems=file_systems,
+                        api_key=api_key,
+                        api_url=api_url,
+                        organization_id=organization_id,
+                        project_id=project_id,
+                        namespace=namespace,
+                        gpu=gpu,
+                        max_pending_secs=max_pending_secs,
+                        auto_resume=auto_resume,
+                    )
+                except RemoteAPIError as e:
+                    if e.status_code != 409:
+                        raise
+                    # Lost the create race: another caller claimed the name
+                    # first. Loop back and attach to the winner.
+                    last_conflict = e
+                    continue
+                created._bind_outcome = "created"
+                return created
+            if status == SandboxStatus.PENDING:
+                # Another caller's create is still starting this sandbox.
+                # Match create(): block until Running, then pick up fresh
+                # proxy routing before handing the sandbox out.
+                info = await sandbox._fresh_running_info_for_rebind(
+                    asyncio.get_running_loop().time() + wait_timeout,
+                    poll_interval=0.5,
+                )
+                sandbox._rebind_proxy(info)
+            elif resume and status in (
+                SandboxStatus.SUSPENDING,
+                SandboxStatus.SUSPENDED,
+            ):
+                if status == SandboxStatus.SUSPENDING:
+                    # The server rejects resume while a suspend is still in
+                    # progress; wait for the suspend to settle first.
+                    status = await cls._wait_out_suspending(sandbox, wait_timeout, name)
+                if status == SandboxStatus.SUSPENDED:
+                    await sandbox.resume(timeout=wait_timeout)
+                elif status == SandboxStatus.TERMINATED:
+                    # The sandbox died while suspending; the name may be
+                    # free again.
+                    continue
+                else:
+                    # Another caller resumed it first. The resumed sandbox
+                    # may live elsewhere, so this handle's routing from
+                    # before the suspend is stale. Match the PENDING
+                    # branch: block until Running with fresh proxy routing.
+                    info = await sandbox._fresh_running_info_for_rebind(
+                        asyncio.get_running_loop().time() + wait_timeout,
+                        poll_interval=0.5,
+                    )
+                    sandbox._rebind_proxy(info)
+                sandbox._bind_outcome = "resumed"
+                return sandbox
+            sandbox._bind_outcome = "attached"
+            return sandbox
+        raise SandboxError(
+            f"get_or_create({name!r}): the name is claimed, but its sandbox "
+            f"could not be attached to after {_GET_OR_CREATE_ATTEMPTS} attempts"
+        ) from last_conflict
+
+    @staticmethod
+    async def _wait_out_suspending(
+        sandbox: "AsyncSandbox",
+        wait_timeout: float,
+        name: str,
+    ) -> SandboxStatus:
+        """Poll until the sandbox leaves ``Suspending``.
+
+        Async mirror of :meth:`Sandbox._wait_out_suspending`; see that
+        method for the semantics.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_timeout
+        while loop.time() < deadline:
+            await asyncio.sleep(0.5)
+            # info() serves the cached SUSPENDING info from connect(); the
+            # status method always fetches fresh state from the server.
+            status = await sandbox.status()
+            if status != SandboxStatus.SUSPENDING:
+                return status
+        raise SandboxError(
+            f"get_or_create({name!r}): the sandbox holding the name did not "
+            f"finish suspending within {wait_timeout}s"
+        )
+
+    @classmethod
+    async def _connect_when_routable(
+        cls,
+        name: str,
+        connect_kwargs: dict[str, Any],
+        wait_timeout: float,
+    ) -> "AsyncSandbox | None":
+        """Poll ``connect`` until the named sandbox has proxy routing.
+
+        Async mirror of :meth:`Sandbox._connect_when_routable`; see that
+        method for the semantics.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_timeout
+        while loop.time() < deadline:
+            await asyncio.sleep(0.5)
+            try:
+                return await cls.connect(name, **connect_kwargs)
+            except SandboxNotFoundError:
+                return None
+            except SandboxNotRoutableError as e:
+                if e.status == SandboxStatus.TERMINATED:
+                    return None
+        raise SandboxError(
+            f"get_or_create({name!r}): the sandbox holding the name did not "
+            f"become connectable within {wait_timeout}s"
+        )
+
+    # --- Lifecycle ---
+
+    def _require_lifecycle_client(self, operation: str) -> None:
+        if self._lifecycle_client is None:
+            raise SandboxError(
+                f"Cannot {operation}: no lifecycle client available. "
+                "Use AsyncSandbox.create() or AsyncSandbox.connect() to get a "
+                "lifecycle-aware handle."
+            )
+
+    async def suspend(
+        self,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+    ) -> None:
+        self._require_lifecycle_client("suspend")
+        await self._lifecycle_client.suspend(
+            self._lifecycle_identifier(),
+            wait=wait,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+
+    async def resume(
+        self,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+    ) -> None:
+        """Resume this sandbox.
+
+        By default waits until the sandbox is ``Running`` and refreshes this
+        handle's cached proxy routing. Rare transient proxy errors may still
+        occur immediately after resume.
+
+        Passing ``wait=False`` is fire-and-return and does not refresh cached
+        proxy routing on this handle. Use the default ``wait=True`` for
+        immediate follow-up operations; if using ``wait=False``, wait until the
+        sandbox is running and reconnect to get fresh routing before issuing
+        process/file/PTY operations.
+        """
+        self._require_lifecycle_client("resume")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        remaining = max(0.0, deadline - loop.time())
+        await self._lifecycle_client.resume(
+            self._lifecycle_identifier(),
+            wait=wait,
+            timeout=remaining,
+            poll_interval=poll_interval,
+        )
+        if wait:
+            info = await self._fresh_running_info_for_rebind(deadline, poll_interval)
+            self._rebind_proxy(info)
+
+    async def attach_file_system(
+        self,
+        file_system_id: str,
+        mount_path: str,
+        *,
+        read_only: bool = False,
+        prefetch: bool = False,
+        snapshot_id: str | None = None,
+        owner: str | None = None,
+    ) -> Traced[SandboxInfo]:
+        """Attach a registered file system to this running sandbox.
+
+        Args:
+            file_system_id: The registered file system's name (created with
+                ``tl fs create <name>``).
+            mount_path: Absolute, unique guest mount path (e.g. ``/mnt/skills``).
+            read_only: Mount the file system read-only.
+            prefetch: Eagerly download the file system's contents.
+            snapshot_id: Pin the mount to a specific filesystem snapshot.
+                Requires ``read_only=True``.
+            owner: Present the mounted files as owned by this guest user:
+                ``NAME``, ``UID``, ``NAME:GROUP``, or ``UID:GID`` (e.g.
+                ``"agent"`` or ``"1001:1001"``), resolved against the sandbox
+                image's own user database when the mount attaches. Unset keeps
+                the image default (the baked ``tl-user`` account when the
+                image has one, otherwise root).
+
+        Returns:
+            Traced[SandboxInfo] with this sandbox's updated file systems.
+        """
+        self._require_lifecycle_client("attach_file_system")
+        traced = await self._lifecycle_client.attach_file_system(
+            self._lifecycle_identifier(),
+            file_system_id,
+            mount_path,
+            read_only=read_only,
+            prefetch=prefetch,
+            snapshot_id=snapshot_id,
+            owner=owner,
+        )
+        self._sandbox_id = traced.sandbox_id
+        self._cached_info = traced.value
+        return traced
+
+    async def detach_file_system(self, mount_path: str) -> Traced[SandboxInfo]:
+        """Detach the file system mounted at ``mount_path`` from this sandbox.
+
+        Args:
+            mount_path: Absolute guest mount path of the file system to
+                unmount.
+
+        Returns:
+            Traced[SandboxInfo] with this sandbox's updated file systems.
+        """
+        self._require_lifecycle_client("detach_file_system")
+        traced = await self._lifecycle_client.detach_file_system(
+            self._lifecycle_identifier(), mount_path
+        )
+        self._sandbox_id = traced.sandbox_id
+        self._cached_info = traced.value
+        return traced
+
+    async def list_file_systems(self) -> list[FileSystemMount]:
+        """List file systems currently mounted into this sandbox.
+
+        Returns:
+            The file systems mounted into this sandbox, each with its
+            ``file_system_id`` and guest ``mount_path``.
+        """
+        self._require_lifecycle_client("list_file_systems")
+        info = (await self._lifecycle_client.get(self._lifecycle_identifier())).value
+        self._sandbox_id = info.sandbox_id
+        self._cached_info = info
+        return info.file_systems
+
+    async def copy(
+        self,
+        *,
+        times: int = 1,
+        request_timeout: float | None = None,
+    ) -> Traced[CopySandboxResponse]:
+        self._require_lifecycle_client("copy")
+        return await self._lifecycle_client.copy(
+            self._lifecycle_identifier(),
+            times=times,
+            request_timeout=request_timeout,
+        )
+
+    async def checkpoint(
+        self,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+        checkpoint_type: CheckpointType | None = None,
+        wait_until: SnapshotWaitCondition | str = SnapshotWaitCondition.LOCAL_READY,
+    ) -> SnapshotInfo | None:
+        self._require_lifecycle_client("checkpoint")
+        snapshot_type = (
+            SnapshotType(checkpoint_type.value) if checkpoint_type is not None else None
+        )
+        if not wait:
+            await self._lifecycle_client.snapshot(
+                self._lifecycle_identifier(), snapshot_type=snapshot_type
+            )
+            return None
+        traced = await self._lifecycle_client.snapshot_and_wait(
+            self._lifecycle_identifier(),
+            timeout=timeout,
+            poll_interval=poll_interval,
+            snapshot_type=snapshot_type,
+            wait_until=wait_until,
+        )
+        return traced.value
+
+    async def list_snapshots(self) -> TracedIterator[SnapshotInfo]:
+        self._require_lifecycle_client("list_snapshots")
+        my_id = self._sandbox_id or (await self._fetch_info()).sandbox_id
+        return await self._lifecycle_client.list_sandbox_snapshots(my_id)
+
+    async def get_logs(
+        self,
+        *,
+        levels: list[SandboxLogLevel | str] | None = None,
+        process_ids: list[str] | None = None,
+        next_token: str | None = None,
+        head: int | None = None,
+        tail: int | None = None,
+        body: str | None = None,
+    ) -> Traced[SandboxLogsResponse]:
+        self._require_lifecycle_client("get_logs")
+        sandbox_id = self._sandbox_id or (await self._fetch_info()).sandbox_id
+        traced = await self._lifecycle_client.get_logs(
+            sandbox_id,
+            levels=levels,
+            process_ids=process_ids,
+            next_token=next_token,
+            head=head,
+            tail=tail,
+            body=body,
+        )
+        self._trace_id = traced.trace_id
+        return traced
+
+    async def list_log_processes(self) -> Traced[SandboxProcessLogFiltersResponse]:
+        self._require_lifecycle_client("list_log_processes")
+        sandbox_id = self._sandbox_id or (await self._fetch_info()).sandbox_id
+        traced = await self._lifecycle_client.list_log_processes(sandbox_id)
+        self._trace_id = traced.trace_id
+        return traced
+
+    async def _fetch_info(self) -> SandboxInfo:
+        if self._cached_info is None:
+            if self._lifecycle_client is None:
+                raise SandboxError(
+                    "Cannot resolve sandbox info: no lifecycle client available."
+                )
+            lookup_id = self._sandbox_id or self._identifier
+            self._cached_info = (await self._lifecycle_client.get(lookup_id)).value
+        return self._cached_info
+
+    async def info(self) -> SandboxInfo:
+        """Fetch current sandbox information, including changes made by other clients."""
+        self._require_lifecycle_client("info")
+        self._cached_info = (
+            await self._lifecycle_client.get(self._lifecycle_identifier())
+        ).value
+        self._sandbox_id = self._cached_info.sandbox_id
+        return self._cached_info
+
+    def _lifecycle_identifier(self) -> str:
+        if self._sandbox_id is not None:
+            return self._sandbox_id
+        if self._cached_info is not None:
+            self._sandbox_id = self._cached_info.sandbox_id
+            return self._sandbox_id
+        return self._identifier
+
+    @property
+    def sandbox_id(self) -> str:
+        if self._sandbox_id is not None:
+            return self._sandbox_id
+        if self._cached_info is None:
+            raise SandboxError(
+                "sandbox_id is not yet known; call `await sandbox.info()` first."
+            )
+        self._sandbox_id = self._cached_info.sandbox_id
+        return self._sandbox_id
+
+    @property
+    def bind_outcome(self) -> GetOrCreateOutcome | None:
+        """What :meth:`get_or_create` did to bind the name.
+
+        ``"created"``, ``"attached"``, or ``"resumed"``; ``None`` for
+        handles from :meth:`create` or :meth:`connect`.
+        """
+        return self._bind_outcome
+
+    @property
+    def trace_id(self) -> str | None:
+        return self._trace_id
+
+    async def status(self) -> SandboxStatus:
+        self._require_lifecycle_client("read_status")
+        info = (await self._lifecycle_client.get(self._lifecycle_identifier())).value
+        self._sandbox_id = info.sandbox_id
+        self._cached_info = info
+        return info.status
+
+    async def update(
+        self,
+        name: str | None = None,
+        *,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+        auto_resume: bool | None = None,
+        network: NetworkConfig | ClearNetworkPolicy | None = None,
+    ) -> Traced[SandboxInfo]:
+        """Update this sandbox's properties.
+
+        Resource names and units match create. Which runtimes and dimensions
+        support a live resize is decided by the server, whose policy error is
+        raised unchanged. Resize requires a running sandbox and cannot be mixed
+        with name, proxy, or network changes. Omitted dimensions retain their
+        confirmed allocation.
+        Integer-valued floats such as 2048.0 are accepted for memory and disk;
+        fractional values and booleans are rejected without rounding.
+
+        If all targets already match, no update is sent. The returned resources
+        are current, but resource_resize can be None or describe an earlier
+        operation, including a failed one. Wait options are ignored when no
+        resource targets are supplied.
+
+        Args:
+            name: New sandbox name. Naming an ephemeral sandbox makes it
+                non-ephemeral and enables suspend/resume.
+            cpus: Finite positive whole-vCPU target, using create's CPU units.
+            memory_mb: Positive integer memory target in MiB.
+            disk_mb: Positive integer root disk target in MiB; cannot shrink
+                below the current confirmed disk size.
+            wait: Wait for resize completion (default True). False returns
+                admission; use wait_for_resource_resize() to continue later.
+            timeout: Maximum seconds to wait for resize completion (default
+                300). Does not change sandbox lifetime or cancel the resize.
+                Zero checks once. Ignored when wait is False.
+            poll_interval: Seconds between resize polls (default 1.0); must
+                be positive. Ignored when wait is False.
+            allow_unauthenticated_access: Whether exposed user ports should be
+                reachable without Tensorlake auth.
+            auto_resume: Omit to keep the current flag. False requires a named
+                sandbox. May be changed while suspended without waking it;
+                cannot be combined with resource resizing.
+            exposed_ports: User ports routable through the sandbox proxy.
+                Port 9501 is reserved for sandbox management.
+            network: Egress network policy. Omit to leave it unchanged, pass a
+                NetworkConfig to replace it atomically, or CLEAR_NETWORK_POLICY
+                to restore unrestricted egress. Unresolvable destinations
+                reject the update and leave the previous policy enforced.
+
+        Returns:
+            Traced[SandboxInfo] with confirmed resources and the latest resize
+            metadata, which may belong to an earlier operation for a no-op.
+
+        Raises:
+            SandboxResizeError: The resize failed, timed out, was interrupted,
+                was superseded, or returned incompatible completion metadata.
+                Carries generation, reason, and confirmed_resources.
+            SandboxError: Invalid targets, wait options, or mixed update fields.
+            SandboxNotFoundError: The sandbox does not exist.
+            RemoteAPIError: The API rejected the request.
+            SandboxConnectionError: The server is unreachable.
+        """
+        self._require_lifecycle_client("update")
+        resource_options = (
+            dict(
+                cpus=cpus,
+                memory_mb=memory_mb,
+                disk_mb=disk_mb,
+                wait=wait,
+                timeout=timeout,
+                poll_interval=poll_interval,
+            )
+            if any(value is not None for value in (cpus, memory_mb, disk_mb))
+            else {}
+        )
+        traced = await self._lifecycle_client.update_sandbox(
+            self._lifecycle_identifier(),
+            **resource_options,
+            name=name,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=exposed_ports,
+            auto_resume=auto_resume,
+            network=network,
+        )
+        self._sandbox_id = traced.sandbox_id
+        self._cached_info = traced.value
+        return traced
+
+    async def wait_for_resource_resize(
+        self,
+        generation: int,
+        *,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+    ) -> Traced[SandboxInfo]:
+        """Wait for an exact resize generation without submitting another update.
+
+        Args:
+            generation: Positive generation returned by the update or timeout error.
+            timeout: Maximum wait in seconds (default 300). Timeout never
+                cancels the resize; call this method again to keep waiting.
+                Zero checks once.
+            poll_interval: Positive seconds between polls (default 1.0).
+
+        Returns:
+            Traced[SandboxInfo] with the completed generation's confirmed resources.
+
+        Raises:
+            SandboxResizeError: Failure, timeout, interruption, superseding, or
+                incompatible metadata; includes the last confirmed_resources.
+            SandboxError: Invalid generation or wait options.
+            SandboxNotFoundError: The sandbox does not exist.
+            RemoteAPIError: The API rejected the request.
+            SandboxConnectionError: The server is unreachable.
+        """
+        self._require_lifecycle_client("wait_for_resource_resize")
+        traced = await self._lifecycle_client.wait_for_resource_resize(
+            self._lifecycle_identifier(),
+            generation,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+        self._sandbox_id = traced.sandbox_id
+        self._cached_info = traced.value
+        return traced
+
+    async def __aenter__(self) -> "AsyncSandbox":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._owns_sandbox:
+            await self.terminate()
+        else:
+            self.close()
+
+    def close(self) -> None:
+        self._rust_client.close()
+
+    async def terminate(self) -> None:
+        lifecycle_client = self._lifecycle_client
+        delete_identifier = self._sandbox_id or self._identifier
+        self._owns_sandbox = False
+        self._lifecycle_client = None
+        self.close()
+        if lifecycle_client is not None:
+            await lifecycle_client.delete(delete_identifier)
+
+    # --- High-level convenience ---
+
+    async def run(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        working_dir: str | None = None,
+        timeout: float | None = None,
+        user: ProcessUser | None = None,
+    ) -> Traced[CommandResult]:
+        process_user = Sandbox._normalize_process_user(user)
+        payload = Sandbox._build_command_payload(
+            command,
+            args,
+            env,
+            working_dir,
+            timeout=timeout,
+            user=process_user,
+        )
+        try:
+            trace_id, events_json = await self._rust_client.run_process_json_async(
+                json.dumps(payload)
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+        return Traced(trace_id, Sandbox._command_result_from_run_events(events_json))
+
+    # --- Process management ---
+
+    async def start_process(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        working_dir: str | None = None,
+        stdin_mode: StdinMode = StdinMode.CLOSED,
+        stdout_mode: OutputMode = OutputMode.CAPTURE,
+        stderr_mode: OutputMode = OutputMode.CAPTURE,
+        user: ProcessUser | None = None,
+        name: str | None = None,
+        restart: RestartPolicyConfig | Mapping[str, object] | None = None,
+        health_check: ProcessHealthCheck | Mapping[str, object] | None = None,
+    ) -> Traced[ProcessInfo]:
+        if name is not None:
+            _validate_managed_name_client_side(name)
+        process_user = Sandbox._normalize_process_user(user)
+        restart_payload = Sandbox._normalize_restart_config(restart)
+        health_check_payload = Sandbox._normalize_health_check(health_check)
+        payload = Sandbox._build_command_payload(
+            command,
+            args,
+            env,
+            working_dir,
+            stdin_mode=stdin_mode if stdin_mode != StdinMode.CLOSED else None,
+            stdout_mode=stdout_mode if stdout_mode != OutputMode.CAPTURE else None,
+            stderr_mode=stderr_mode if stderr_mode != OutputMode.CAPTURE else None,
+            user=process_user,
+            name=name,
+            restart=restart_payload,
+            health_check=health_check_payload,
+        )
+        try:
+            trace_id, response_json = await self._rust_client.start_process_json_async(
+                json.dumps(payload)
+            )
+            return Traced(trace_id, ProcessInfo.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def list_processes(self) -> TracedIterator[ProcessInfo]:
+        try:
+            trace_id, response_json = (
+                await self._rust_client.list_processes_json_async()
+            )
+            data = ListProcessesResponse.model_validate_json(response_json)
+            return TracedIterator(trace_id, data.processes)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def get_process(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[ProcessInfo]:
+        """Get information about a process by PID or process name given on creation."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, response_json = await self._rust_client.get_process_json_async(
+                seg
+            )
+            return Traced(trace_id, ProcessInfo.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def kill_process(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[None]:
+        """Kill a process and everything it started.
+
+        The daemon tears the process down as one unit. An unmanaged process's
+        whole process group is SIGKILLed at once, including children that
+        detached with ``setsid``. For a managed process this stops the whole
+        supervisor (it will not be restarted) gracefully: SIGTERM to the
+        process group, then SIGKILL once the process's ``stop_grace_ms``
+        (default 10 s) has elapsed.
+
+        Args:
+            process: PID or process name given on creation.
+        """
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id = await self._rust_client.kill_process_async(seg)
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def restart_process(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[ProcessInfo]:
+        """Restart a managed process by PID or process name given on creation."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, response_json = (
+                await self._rust_client.restart_process_json_async(seg)
+            )
+            return Traced(trace_id, ProcessInfo.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def send_signal(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        signal: int = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[SendSignalResponse]:
+        """Send a signal to a process and everything it started.
+
+        The signal is delivered to the process's whole process group, as a
+        terminal's job control would; SIGKILL also reaps children that
+        detached with ``setsid``. There is no escalation: a process that
+        ignores SIGTERM keeps running.
+
+        Args:
+            process: PID or process name given on creation.
+            signal: Signal number (e.g. 15 for SIGTERM, 9 for SIGKILL)
+        """
+        seg = _resolve_process_arg(process, pid)
+        if signal is _PROCESS_ARG_UNSET:
+            raise TypeError("missing required argument: `signal`")
+        try:
+            trace_id, response_json = await self._rust_client.send_signal_json_async(
+                seg, signal
+            )
+            return Traced(
+                trace_id, SendSignalResponse.model_validate_json(response_json)
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    # --- Process I/O ---
+
+    async def write_stdin(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        data: bytes = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[None]:
+        """Write data to a process's stdin by PID or process name given on creation."""
+        seg = _resolve_process_arg(process, pid)
+        if data is _PROCESS_ARG_UNSET:
+            raise TypeError("missing required argument: `data`")
+        try:
+            trace_id = await self._rust_client.write_stdin_async(seg, data)
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def close_stdin(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[None]:
+        """Close a process's stdin by PID or process name given on creation."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id = await self._rust_client.close_stdin_async(seg)
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def get_stdout(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[OutputResponse]:
+        """Get all stdout output from a process by PID or process name given on creation."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, response_json = await self._rust_client.get_stdout_json_async(seg)
+            return Traced(trace_id, OutputResponse.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def get_stderr(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[OutputResponse]:
+        """Get all stderr output from a process by PID or process name given on creation."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, response_json = await self._rust_client.get_stderr_json_async(seg)
+            return Traced(trace_id, OutputResponse.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def get_output(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[OutputResponse]:
+        """Get all combined output from a process by PID or process name given on creation."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, response_json = await self._rust_client.get_output_json_async(seg)
+            return Traced(trace_id, OutputResponse.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def follow_stdout(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> TracedIterator[OutputEvent]:
+        """Follow stdout output events by PID or process name given on creation."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, events_json = await self._rust_client.follow_stdout_json_async(
+                seg
+            )
+            return TracedIterator(
+                trace_id, [OutputEvent.model_validate_json(ej) for ej in events_json]
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def follow_stderr(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> TracedIterator[OutputEvent]:
+        """Follow stderr output events by PID or process name given on creation."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, events_json = await self._rust_client.follow_stderr_json_async(
+                seg
+            )
+            return TracedIterator(
+                trace_id, [OutputEvent.model_validate_json(ej) for ej in events_json]
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def follow_output(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> TracedIterator[OutputEvent]:
+        """Follow combined output events by PID or process name given on creation."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, events_json = await self._rust_client.follow_output_json_async(
+                seg
+            )
+            return TracedIterator(
+                trace_id, [OutputEvent.model_validate_json(ej) for ej in events_json]
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    # --- File operations ---
+
+    async def read_file(self, path: str) -> Traced[bytes]:
+        try:
+            trace_id, data = await self._rust_client.read_file_bytes_async(path=path)
+            return Traced(trace_id, data)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def write_file(self, path: str, content: bytes) -> Traced[None]:
+        try:
+            trace_id = await self._rust_client.write_file_async(
+                path=path, content=content
+            )
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def upload_file(
+        self, local_path: str | os.PathLike[str], path: str
+    ) -> Traced[None]:
+        try:
+            trace_id = await self._rust_client.upload_file_async(
+                path=path, local_path=os.fspath(local_path)
+            )
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def delete_file(self, path: str) -> Traced[None]:
+        try:
+            trace_id = await self._rust_client.delete_file_async(path=path)
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def list_directory(self, path: str) -> Traced[ListDirectoryResponse]:
+        try:
+            trace_id, response_json = await self._rust_client.list_directory_json_async(
+                path=path
+            )
+            return Traced(
+                trace_id, ListDirectoryResponse.model_validate_json(response_json)
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    # --- PTY sessions ---
+
+    async def create_pty_session(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        working_dir: str | None = None,
+        rows: int = 24,
+        cols: int = 80,
+    ) -> Traced[dict]:
+        """Create an interactive PTY session.
+
+        Returns a Traced dict with ``session_id`` and ``token`` for WebSocket
+        connection via :meth:`pty_ws_url`.
+        """
+        payload: dict = {"command": command, "rows": rows, "cols": cols}
+        if args is not None:
+            payload["args"] = args
+        if env is not None:
+            payload["env"] = env
+        if working_dir is not None:
+            payload["working_dir"] = working_dir
+
+        try:
+            trace_id, response_json = (
+                await self._rust_client.create_pty_session_json_async(
+                    json.dumps(payload)
+                )
+            )
+            return Traced(trace_id, json.loads(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def pty_ws_url(self, session_id: str, token: str) -> str:
+        """Construct the WebSocket URL for a PTY session.
+
+        The token is NOT included in the URL query string to avoid leaking it
+        into proxy/CDN access logs. Callers should send the token via the
+        ``X-PTY-Token`` header on the WebSocket upgrade request instead.
+        """
+        base = self._base_url.rstrip("/")
+        if base.startswith("https://"):
+            ws_base = "wss://" + base[8:]
+        elif base.startswith("http://"):
+            ws_base = "ws://" + base[7:]
+        else:
+            ws_base = base
+        return f"{ws_base}/api/v1/pty/{session_id}/ws"
+
+    async def connect_pty(
+        self,
+        session_id: str,
+        token: str,
+        *,
+        on_data=None,
+        on_exit=None,
+        connect_timeout: float = 10.0,
+    ):
+        """Attach to an existing PTY session and return a connected async handle."""
+        from .pty import build_async_pty_connection
+
+        pty = build_async_pty_connection(
+            session_id=session_id,
+            token=token,
+            ws_url=self.pty_ws_url(session_id, token),
+            http_url=f"{self._base_url.rstrip('/')}/api/v1/pty/{session_id}",
+            ws_headers=self._proxy_headers,
+            http_headers=self._proxy_headers,
+            connect_timeout=connect_timeout,
+        )
+        if on_data is not None:
+            pty.on_data(on_data)
+        if on_exit is not None:
+            pty.on_exit(on_exit)
+        return await pty.connect()
+
+    async def _delete_pty_session(
+        self, session_id: str, *, timeout: float = 10.0
+    ) -> None:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.delete(
+                f"{self._base_url.rstrip('/')}/api/v1/pty/{session_id}",
+                headers=inject_traceparent(self._proxy_headers),
+            )
+        if response.is_success or response.status_code == 404:
+            return
+        raise RemoteAPIError(response.status_code, response.text)
+
+    async def create_pty(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        working_dir: str | None = None,
+        rows: int = 24,
+        cols: int = 80,
+        *,
+        on_data=None,
+        on_exit=None,
+        connect_timeout: float = 10.0,
+    ):
+        """Create a PTY session, connect immediately, and return its handle."""
+        traced_session = await self.create_pty_session(
+            command=command,
+            args=args,
+            env=env,
+            working_dir=working_dir,
+            rows=rows,
+            cols=cols,
+        )
+        session = traced_session.value
+        try:
+            return await self.connect_pty(
+                session["session_id"],
+                session["token"],
+                on_data=on_data,
+                on_exit=on_exit,
+                connect_timeout=connect_timeout,
+            )
+        except Exception:
+            try:
+                await self._delete_pty_session(
+                    session["session_id"], timeout=connect_timeout
+                )
+            except Exception:
+                pass
+            raise
+
+    async def create_tunnel(
+        self,
+        remote_port: int,
+        *,
+        local_host: str = DEFAULT_LOCAL_HOST,
+        local_port: int | None = None,
+        connect_timeout: float = DEFAULT_TUNNEL_CONNECT_TIMEOUT,
+    ) -> AsyncTcpTunnel:
+        """Open a TCP tunnel to a port inside the sandbox and return the local listener.
+
+        Each connection to ``local_host:local_port`` is relayed to
+        ``remote_port`` inside the sandbox. ``local_port`` defaults to
+        ``remote_port``; pass ``0`` to bind an ephemeral port. Close the
+        returned :class:`~tensorlake.sandbox.AsyncTcpTunnel` when done.
+        """
+        return await AsyncTcpTunnel.listen(
+            base_url=self._base_url,
+            ws_headers=self._proxy_headers,
+            remote_port=remote_port,
+            local_host=local_host,
+            local_port=local_port,
+            connect_timeout=connect_timeout,
+        )
+
+    # --- Health and info ---
+
+    async def health(self) -> Traced[HealthResponse]:
+        try:
+            trace_id, response_json = await self._rust_client.health_json_async()
+            return Traced(trace_id, HealthResponse.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    async def daemon_info(self) -> Traced[DaemonInfo]:
+        try:
+            trace_id, response_json = await self._rust_client.info_json_async()
+            return Traced(trace_id, DaemonInfo.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)

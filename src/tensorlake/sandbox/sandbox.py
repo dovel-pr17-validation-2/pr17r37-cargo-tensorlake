@@ -1,0 +1,2410 @@
+"""Client for interacting with a running sandbox."""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Literal, overload
+from urllib.parse import urlparse
+
+import httpx
+from pydantic import ValidationError
+
+from tensorlake._tracing import USER_AGENT, Traced, TracedIterator, inject_traceparent
+
+from . import _defaults
+from .exceptions import (
+    RemoteAPIError,
+    SandboxConnectionError,
+    SandboxError,
+    SandboxNotFoundError,
+    SandboxNotRoutableError,
+    SandboxPending,
+)
+from .models import (
+    CheckpointType,
+    ClearNetworkPolicy,
+    CommandExitReason,
+    CommandResult,
+    CopySandboxResponse,
+    DaemonInfo,
+    FileSystemMount,
+    GetOrCreateOutcome,
+    GpuModel,
+    GpuRequest,
+    HealthResponse,
+    ListDirectoryResponse,
+    ListProcessesResponse,
+    NetworkConfig,
+    OutputEvent,
+    OutputMode,
+    OutputResponse,
+    PendingSandbox,
+    ProcessHealthCheck,
+    ProcessInfo,
+    ProcessUser,
+    ProcessUserSpec,
+    RestartPolicyConfig,
+    SandboxInfo,
+    SandboxLogLevel,
+    SandboxLogsResponse,
+    SandboxProcessLogFiltersResponse,
+    SandboxStatus,
+    SendSignalResponse,
+    SnapshotInfo,
+    SnapshotType,
+    SnapshotWaitCondition,
+    StdinMode,
+)
+from .tunnel import DEFAULT_LOCAL_HOST, DEFAULT_TUNNEL_CONNECT_TIMEOUT, TcpTunnel
+
+# Avoid circular import: sandbox.py ↔ client.py.  With ``from __future__
+# import annotations`` the type string is never evaluated at runtime, but
+# the import itself would still execute and trigger a cycle.
+if TYPE_CHECKING:
+    from .client import SandboxClient
+
+try:
+    from tensorlake._cloud_sdk import (
+        CloudSandboxClientError as RustCloudSandboxClientError,
+    )
+    from tensorlake._cloud_sdk import (
+        CloudSandboxDesktopClient as RustCloudSandboxDesktopClient,
+    )
+    from tensorlake._cloud_sdk import (
+        CloudSandboxProxyClient as RustCloudSandboxProxyClient,
+    )
+
+    _RUST_SANDBOX_PROXY_CLIENT_AVAILABLE = True
+except Exception:
+    try:
+        from _cloud_sdk import CloudSandboxClientError as RustCloudSandboxClientError
+        from _cloud_sdk import (
+            CloudSandboxDesktopClient as RustCloudSandboxDesktopClient,
+        )
+        from _cloud_sdk import CloudSandboxProxyClient as RustCloudSandboxProxyClient
+
+        _RUST_SANDBOX_PROXY_CLIENT_AVAILABLE = True
+    except Exception:
+        RustCloudSandboxDesktopClient = None
+        RustCloudSandboxProxyClient = None
+        RustCloudSandboxClientError = None
+        _RUST_SANDBOX_PROXY_CLIENT_AVAILABLE = False
+
+
+def _parse_rust_client_error_fields(
+    e: Exception,
+) -> tuple[str | None, int | None, str]:
+    kind: str | None = None
+    status_code: int | None = None
+    message = str(e)
+
+    if len(e.args) == 3:
+        kind, status_code, message = e.args
+    elif len(e.args) == 1 and isinstance(e.args[0], tuple) and len(e.args[0]) == 3:
+        kind, status_code, message = e.args[0]
+
+    return kind, status_code, message
+
+
+def _raise_as_sandbox_error(e: Exception) -> None:
+    if isinstance(e, SandboxError):
+        raise
+
+    if (
+        RustCloudSandboxClientError is not None
+        and isinstance(e, RustCloudSandboxClientError)
+        and len(e.args) > 0
+    ):
+        kind, status_code, message = _parse_rust_client_error_fields(e)
+        if kind == "connection":
+            raise SandboxConnectionError(message) from None
+        if status_code is not None:
+            raise RemoteAPIError(status_code, message) from None
+        raise SandboxError(message) from None
+
+    raise SandboxError(str(e)) from e
+
+
+# Sentinel distinguishing "argument omitted" from an explicit value, so the deprecated `pid`
+# keyword can coexist with the new `process` parameter (and with the required second arg of
+# send_signal/write_stdin).
+_PROCESS_ARG_UNSET = object()
+
+
+def _validate_managed_name_client_side(name: str) -> None:
+    """Validate a managed-process name via the Rust core (raises ValueError on failure).
+
+    Degrades gracefully if the installed native module predates this validator (version
+    skew between the Python package and the compiled extension) -- the cloud SDK's
+    ``start_process`` and the daemon both re-validate authoritatively.
+    """
+    try:
+        from _cloud_sdk import validate_managed_name as _vmn
+    except ImportError:
+        return
+    _vmn(name)
+
+
+def _resolve_process_arg(process: object, pid: object) -> str:
+    """Resolve the process selector from the new ``process`` arg and the deprecated ``pid``.
+
+    Accepts a pid (int) or a managed-process name (str) and returns the path segment string.
+    Emits a ``DeprecationWarning`` when the old ``pid`` keyword is used; errors if both or
+    neither are given.
+    """
+    if pid is not _PROCESS_ARG_UNSET:
+        if process is not _PROCESS_ARG_UNSET:
+            raise TypeError("pass either `process` or `pid`, not both")
+        import warnings
+
+        warnings.warn(
+            "`pid` is deprecated; use `process` (accepts a PID or a managed-process name)",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        process = pid
+    if process is _PROCESS_ARG_UNSET:
+        raise TypeError("missing required argument: `process`")
+    return str(process)
+
+
+# ``get_or_create``: how many connect-or-create attempts to make when a
+# named sandbox is caught mid-handoff (for example, its previous holder is
+# still terminating), and the base delay between attempts.
+_GET_OR_CREATE_ATTEMPTS = 4
+_GET_OR_CREATE_RETRY_DELAY_SEC = 0.5
+
+
+class Sandbox:
+    """Client for interacting with a running sandbox.
+
+    Provides process management, file operations, and I/O streaming
+    through the sandbox proxy.
+
+    Direct construction requires ``proxy_url``. Prefer ``Sandbox.connect()``
+    or ``SandboxClient.connect()`` so the server-returned sandbox URL is used.
+
+    Can be used as a context manager. If created via
+    ``SandboxClient.create_and_connect()``, exiting the context manager
+    automatically terminates the sandbox. Otherwise, it only closes the
+    client while the sandbox continues running.
+    """
+
+    def __init__(
+        self,
+        identifier: str | None = None,
+        proxy_url: str | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        *,
+        sandbox_id: str | None = None,
+        routing_hint: str | None = None,
+        request_timeout: float | None = None,
+        _proxy_rust_client: object | None = None,
+        _explicit_proxy_url: str | None = None,
+    ):
+        if identifier and sandbox_id and identifier != sandbox_id:
+            raise SandboxError(
+                "Provide only one of `identifier` or `sandbox_id`, not both."
+            )
+        sandbox_identifier = identifier or sandbox_id
+        if not sandbox_identifier:
+            raise SandboxError(
+                "`identifier` is required. `sandbox_id` is accepted as a deprecated alias."
+            )
+        if proxy_url is None:
+            if _proxy_rust_client is None:
+                raise SandboxError(
+                    "`proxy_url` is required for direct Sandbox construction; "
+                    "use Sandbox.connect(...) or SandboxClient.connect(...) to use "
+                    "the server-returned sandbox_url."
+                )
+            proxy_url = _proxy_rust_client.base_url()
+
+        self._identifier = sandbox_identifier
+        self._sandbox_id: str | None = None
+        self._bind_outcome: GetOrCreateOutcome | None = None
+        self._trace_id: str | None = None
+        self._cached_info: SandboxInfo | None = None
+        self._owns_sandbox: bool = False
+        self._lifecycle_client: SandboxClient | None = None
+        self._proxy_url = proxy_url
+        self._api_key = api_key
+        self._organization_id = organization_id
+        self._project_id = project_id
+        self._request_timeout = request_timeout
+        self._explicit_proxy_url = _explicit_proxy_url
+        self._set_proxy_transport(proxy_url, sandbox_identifier)
+
+        if _proxy_rust_client is not None:
+            self._rust_client = _proxy_rust_client
+            self._base_url = self._rust_client.base_url()
+        elif not _RUST_SANDBOX_PROXY_CLIENT_AVAILABLE:
+            raise SandboxError(
+                "Rust Cloud SDK sandbox proxy client is required but unavailable. "
+                "Build/install it with `make build_rust_py_client`."
+            )
+        else:
+            try:
+                kwargs = {
+                    "proxy_url": proxy_url,
+                    "sandbox_id": sandbox_identifier,
+                    "api_key": api_key,
+                    "organization_id": organization_id,
+                    "project_id": project_id,
+                    "routing_hint": routing_hint,
+                    "user_agent": USER_AGENT,
+                }
+                if request_timeout is not None:
+                    kwargs["request_timeout_sec"] = request_timeout
+                self._rust_client = RustCloudSandboxProxyClient(**kwargs)
+                self._base_url = self._rust_client.base_url()
+            except Exception as e:
+                _raise_as_sandbox_error(e)
+
+    def _set_proxy_transport(self, proxy_url: str, sandbox_identifier: str) -> None:
+        self._proxy_url = proxy_url
+        parsed_proxy = urlparse(proxy_url)
+        self._host_header = None
+        if parsed_proxy.hostname in ("localhost", "127.0.0.1"):
+            self._host_header = f"{sandbox_identifier}.local"
+        self._proxy_headers = {}
+        if self._api_key:
+            self._proxy_headers["Authorization"] = f"Bearer {self._api_key}"
+        if self._organization_id:
+            self._proxy_headers["X-Forwarded-Organization-Id"] = self._organization_id
+        if self._project_id:
+            self._proxy_headers["X-Forwarded-Project-Id"] = self._project_id
+        if self._host_header:
+            self._proxy_headers["Host"] = self._host_header
+        else:
+            self._proxy_headers["X-Tensorlake-Sandbox-Id"] = sandbox_identifier
+
+    def _rebind_proxy(self, info: SandboxInfo) -> None:
+        self._require_lifecycle_client("refresh proxy routing")
+        if info.status != SandboxStatus.RUNNING:
+            raise SandboxError(
+                f"Sandbox {info.sandbox_id!r} is {info.status.value}; cannot refresh proxy routing"
+            )
+        if info.sandbox_url is None and self._explicit_proxy_url is None:
+            raise SandboxError(
+                f"Sandbox {info.sandbox_id!r} did not include proxy routing information"
+            )
+
+        proxy_url = self._lifecycle_client._rust_client.select_sandbox_proxy_url(
+            sandbox_id=info.sandbox_id,
+            sandbox_url=info.sandbox_url,
+            ingress_endpoint=info.ingress_endpoint,
+            explicit_proxy_url=self._explicit_proxy_url,
+        )
+        connect_proxy_kwargs = {
+            "proxy_url": proxy_url,
+            "sandbox_id": info.sandbox_id,
+            "routing_hint": info.routing_hint,
+        }
+        if self._request_timeout is not None:
+            connect_proxy_kwargs["request_timeout_sec"] = self._request_timeout
+        try:
+            new_rust_client = self._lifecycle_client._rust_client.connect_proxy(
+                **connect_proxy_kwargs
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+        self._rust_client = new_rust_client
+        self._base_url = self._rust_client.base_url()
+        self._set_proxy_transport(proxy_url, info.sandbox_id)
+        self._cached_info = info
+        self._sandbox_id = info.sandbox_id
+
+    def _fresh_running_info_for_rebind(
+        self,
+        deadline: float,
+        poll_interval: float,
+    ) -> SandboxInfo:
+        self._require_lifecycle_client("refresh proxy routing")
+        identifier = self._lifecycle_identifier()
+        started = time.monotonic()
+        last: SandboxInfo | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            request_client = self._lifecycle_client._with_request_timeout(
+                min(remaining, self._lifecycle_client._request_timeout)
+            )
+            info = request_client.get(identifier).value
+            if info.status == SandboxStatus.RUNNING and (
+                info.sandbox_url is not None or self._explicit_proxy_url is not None
+            ):
+                return info
+            if info.status == SandboxStatus.TERMINATED:
+                raise SandboxError(
+                    f"Sandbox {identifier!r} terminated while refreshing proxy routing",
+                    reason=info.termination_reason,
+                    sandbox_id=info.sandbox_id,
+                )
+            last = info
+            time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+        if last is not None and last.status == SandboxStatus.PENDING:
+            # Still queued for capacity: it keeps its place, the caller decides.
+            raise SandboxPending(
+                last.sandbox_id,
+                pending_reason=last.pending_reason,
+                timeout=max(0.0, deadline - started),
+            )
+        raise SandboxError(
+            f"Sandbox {identifier!r} did not provide refreshed proxy routing within timeout",
+            sandbox_id=identifier,
+        )
+
+    # --- Class-level factory methods ---
+
+    @overload
+    @classmethod
+    def create(
+        cls,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        pool_id: str | None = None,
+        snapshot_id: str | None = None,
+        proxy_url: str | None = None,
+        request_timeout: float | None = None,
+        startup_timeout: float | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        cancel_on_timeout: bool = False,
+        wait: Literal[True] = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> "Sandbox": ...
+
+    @overload
+    @classmethod
+    def create(
+        cls,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        pool_id: str | None = None,
+        snapshot_id: str | None = None,
+        proxy_url: str | None = None,
+        request_timeout: float | None = None,
+        startup_timeout: float | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        cancel_on_timeout: bool = False,
+        *,
+        wait: Literal[False],
+        auto_resume: bool | None = None,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> PendingSandbox: ...
+
+    @classmethod
+    def create(
+        cls,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        pool_id: str | None = None,
+        snapshot_id: str | None = None,
+        proxy_url: str | None = None,
+        request_timeout: float | None = None,
+        startup_timeout: float | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        cancel_on_timeout: bool = False,
+        wait: bool = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> "Sandbox | PendingSandbox":
+        """Create a new sandbox and return a connected, running handle.
+
+        Covers both fresh sandbox creation and restore-from-snapshot (set
+        ``snapshot_id``). With ``wait=True`` (the default) it blocks until
+        the sandbox is ``Running``: the server waits and answers as soon as
+        it runs, with ``request_timeout`` as the wait budget.
+
+        With ``wait=False`` it returns a :class:`PendingSandbox` at once:
+        ``pending.ready()`` waits for it, ``pending.status()`` looks at it,
+        and ``Sandbox.connect(pending.sandbox_id)`` collects it from any
+        other process. This is the call for requesting many sandboxes ahead
+        of capacity.
+
+        **When the wait runs out the sandbox is not deleted.** A
+        ``SandboxPending`` is raised carrying the sandbox id; the sandbox
+        keeps its place in the queue and starts whenever capacity arrives.
+        Collect it later with ``Sandbox.connect(sandbox_id)`` or delete it
+        to give up. Pass ``cancel_on_timeout=True`` for the previous
+        delete-then-raise behaviour, or ``max_pending_secs`` to let the
+        server fail it after a bound.
+
+        Args:
+            image: Sandbox image name. When omitted, Tensorlake uses the
+                default managed environment.
+            cpus: Number of CPUs to allocate. Defaults to 1 for a fresh
+                sandbox; omitted snapshot restores inherit this value.
+            memory_mb: Memory in MiB. Defaults to 1024 for a fresh
+                sandbox; omitted snapshot restores inherit this value.
+            disk_mb: Root disk size in MiB. When omitted, the server
+                uses its default disk size.
+            gpus: Number of GPUs to allocate. When provided, defaults to
+                ``A10`` unless ``gpu_model`` is set. GPU CAS sandboxes require a
+                CAS image; when ``image`` is omitted, the server selects its
+                configured GPU default.
+            gpu_model: GPU model to allocate. Accepts any :class:`GpuModel` value.
+                Defaults to one GPU when ``gpus`` is omitted.
+            gpu: Typed GPU model and count request. Cannot be combined with
+                ``gpus`` or ``gpu_model``.
+            timeout_secs: Sandbox timeout in seconds.
+            entrypoint: Custom entrypoint command.
+            allow_internet_access: While ``allow_out`` is empty: True (the
+                default) allows all outbound traffic except ``deny_out``
+                matches; False blocks all egress, including DNS. A
+                non-empty ``allow_out`` is default-deny in both modes; the
+                flag then only controls implicit access to the DNS
+                resolver.
+            allow_out: Destinations to allow (IPs, CIDRs, or hostnames).
+                When non-empty, all unlisted destinations are blocked.
+            deny_out: Destinations to deny; takes precedence over allow_out.
+            pool_id: Pool ID to claim a warm container from.
+            snapshot_id: Restore from this snapshot ID.
+            proxy_url: Override the sandbox proxy URL.
+            request_timeout: Max seconds to wait for HTTP operations.
+            startup_timeout: Deprecated alias for ``request_timeout``.
+            name: Optional name; named sandboxes support suspend/resume.
+                Fails with HTTP 409 (``RemoteAPIError``) when the name is
+                already claimed. To attach to the existing sandbox instead,
+                use :meth:`get_or_create`.
+            file_systems: File systems to mount into the sandbox
+                at boot or warm-pool claim, each at its own absolute, unique
+                guest mount path.
+            api_key: Tensorlake API key (defaults to TENSORLAKE_API_KEY env var).
+            api_url: API server URL (defaults to TENSORLAKE_API_URL env var).
+            organization_id: Organization ID for multi-tenant access.
+            project_id: Project ID for scoping resources.
+            namespace: Namespace for local-server deployments.
+            auto_resume: Whether proxy traffic can wake a suspended sandbox.
+                None defaults to True on create. False requires a named sandbox.
+            max_pending_secs: Longest the sandbox may wait for capacity
+                before the server fails it with reason ``no_capacity``.
+                Unset (the default) waits indefinitely; 30 minutes or more
+                is recommended for capacity waits because metal hosts take
+                up to 20 minutes to boot.
+            cancel_on_timeout: Delete the sandbox when ``request_timeout``
+                runs out while it is still pending, then raise
+                ``SandboxError``. Default False: raise ``SandboxPending``
+                and leave the sandbox queued.
+            wait: ``True`` (default) blocks until running; ``False``
+                returns a :class:`PendingSandbox` at once. Cannot be
+                combined with ``pool_id``.
+            allow_unauthenticated_access: Allow proxy access without
+                authentication when True; require authentication when False.
+                None uses server defaults or inherits the snapshot setting.
+                Cannot be combined with ``pool_id`` because pool claims
+                inherit access settings from the pool.
+            exposed_ports: User ports to expose through the sandbox proxy.
+                Integers from 1 to 65535, excluding reserved port 9501;
+                duplicates are removed and ports sorted. None uses server
+                defaults or inherits the snapshot setting; [] exposes no
+                user ports. Cannot be combined with ``pool_id``.
+
+        Returns:
+            Connected Sandbox handle (auto-terminates in context manager),
+            or a :class:`PendingSandbox` with ``wait=False``.
+
+        Raises:
+            SandboxPending: The wait ran out while the sandbox was still
+                pending; it keeps its place in the queue.
+            SandboxError: If the sandbox fails to start; ``reason`` carries
+                the server's reason (``no_capacity``, ``cancelled``, ...).
+                Also raised when access overrides are combined with ``pool_id``.
+        """
+        from .client import SandboxClient
+
+        effective_request_timeout = (
+            startup_timeout
+            if startup_timeout is not None
+            else (
+                request_timeout
+                if request_timeout is not None
+                else _defaults.DEFAULT_HTTP_TIMEOUT_SEC
+            )
+        )
+        client = SandboxClient(
+            api_url=api_url,
+            api_key=api_key,
+            organization_id=organization_id,
+            project_id=project_id,
+            namespace=namespace,
+            request_timeout=effective_request_timeout,
+            _internal=True,
+        )
+        if not wait:
+            if pool_id is not None:
+                raise SandboxError(
+                    "wait=False cannot be combined with pool_id: a pool claim is "
+                    "answered synchronously"
+                )
+            return client._request_pending(
+                image=image,
+                cpus=cpus,
+                memory_mb=memory_mb,
+                disk_mb=disk_mb,
+                gpus=gpus,
+                gpu_model=gpu_model,
+                timeout_secs=timeout_secs,
+                entrypoint=entrypoint,
+                allow_internet_access=allow_internet_access,
+                allow_out=allow_out,
+                deny_out=deny_out,
+                snapshot_id=snapshot_id,
+                allow_unauthenticated_access=allow_unauthenticated_access,
+                exposed_ports=exposed_ports,
+                name=name,
+                file_systems=file_systems,
+                gpu=gpu,
+                max_pending_secs=max_pending_secs,
+                auto_resume=auto_resume,
+                proxy_url=proxy_url,
+                request_timeout=effective_request_timeout,
+                owns_sandbox=True,
+            )
+        return client.create_and_connect(
+            image=image,
+            cpus=cpus,
+            memory_mb=memory_mb,
+            disk_mb=disk_mb,
+            gpus=gpus,
+            gpu_model=gpu_model,
+            timeout_secs=timeout_secs,
+            entrypoint=entrypoint,
+            allow_internet_access=allow_internet_access,
+            allow_out=allow_out,
+            deny_out=deny_out,
+            pool_id=pool_id,
+            snapshot_id=snapshot_id,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=exposed_ports,
+            proxy_url=proxy_url,
+            request_timeout=effective_request_timeout,
+            name=name,
+            file_systems=file_systems,
+            gpu=gpu,
+            max_pending_secs=max_pending_secs,
+            auto_resume=auto_resume,
+            cancel_on_timeout=cancel_on_timeout,
+        )
+
+    @classmethod
+    def connect(
+        cls,
+        sandbox_id: str,
+        *,
+        proxy_url: str | None = None,
+        routing_hint: str | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        request_timeout: float | None = None,
+    ) -> "Sandbox":
+        """Attach to an existing sandbox and return a connected handle.
+
+        When ``proxy_url`` is omitted, resolves the sandbox first so the handle
+        uses the correct cloud/region ingress endpoint. Does **not** auto-resume
+        a suspended sandbox — call ``sandbox.resume()`` explicitly.
+
+        Args:
+            sandbox_id: ID or name of the sandbox to attach to.
+            proxy_url: Override the sandbox proxy URL.
+            routing_hint: Optional routing hint for the proxy.
+            api_key: Tensorlake API key (defaults to TENSORLAKE_API_KEY env var).
+            api_url: API server URL (defaults to TENSORLAKE_API_URL env var).
+            organization_id: Organization ID for multi-tenant access.
+            project_id: Project ID for scoping resources.
+            namespace: Namespace for local-server deployments.
+
+        Returns:
+            Connected Sandbox handle (does not auto-terminate on context exit).
+        """
+        from .client import SandboxClient
+
+        client = SandboxClient(
+            api_url=api_url,
+            api_key=api_key,
+            organization_id=organization_id,
+            project_id=project_id,
+            namespace=namespace,
+            request_timeout=(
+                request_timeout
+                if request_timeout is not None
+                else _defaults.DEFAULT_HTTP_TIMEOUT_SEC
+            ),
+            _internal=True,
+        )
+        return client.connect(
+            sandbox_id,
+            proxy_url=proxy_url,
+            routing_hint=routing_hint,
+            request_timeout=request_timeout,
+        )
+
+    @classmethod
+    def get_or_create(
+        cls,
+        name: str,
+        *,
+        resume: bool = True,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        snapshot_id: str | None = None,
+        proxy_url: str | None = None,
+        request_timeout: float | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        auto_resume: bool | None = None,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> "Sandbox":
+        """Return the one sandbox bound to ``name``. Create it on first use.
+
+        This is the recommended call for an agent session that derives its
+        sandbox name from its session ID. It declares the intent "this name
+        is my session's sandbox": when a sandbox already holds the name, the
+        call attaches to it instead of failing with HTTP 409 the way
+        ``create`` does.
+
+        The steps, all handled internally:
+
+        1. ``connect(name)`` — finds the sandbox, running or suspended.
+        2. When nothing holds the name, ``create(name=...)`` with the given
+           configuration.
+        3. When that create loses a race against another caller (HTTP 409),
+           connect to the winner.
+        4. When the sandbox is still starting (another caller's create is
+           in flight), wait until it is ``Running``, the same way
+           :meth:`create` blocks for its own caller.
+        5. When the sandbox is suspended, ``resume()`` it. Disable with
+           ``resume=False``.
+
+        Concurrent callers that use the same name all converge on the same
+        sandbox. The configuration arguments (``image``, ``cpus``, ...)
+        apply only when the call creates a new sandbox; an existing sandbox
+        is returned as-is, with whatever configuration it already has.
+
+        The returned handle records what the call did in
+        :attr:`bind_outcome`: ``"created"``, ``"attached"``, or
+        ``"resumed"``. See :data:`~tensorlake.sandbox.GetOrCreateOutcome`.
+
+        For about a second after ``terminate()``, the name still resolves
+        and the sandbox still reports ``running``. A ``get_or_create`` in
+        that window attaches to the dying sandbox. When you recreate right
+        after a terminate, check ``status`` after the call, or wait for the
+        old sandbox to report ``terminated`` first.
+
+        Args:
+            name: Sandbox name; unique within the namespace. Derive it
+                deterministically from your session ID, for example
+                ``f"agent-{session_id}"``.
+            resume: If True (the default), resume a suspended sandbox before
+                returning, so the handle is immediately usable. If False,
+                the returned handle can point at a suspended sandbox; call
+                ``resume()`` yourself before you run anything.
+
+        All other arguments match :meth:`create` and are used only when a
+        new sandbox must be created. ``pool_id`` is the one exception: a
+        pool claim cannot carry a name, so a claimed sandbox could never
+        be found again by a later call. To use a warm pool, ``create``
+        with ``pool_id`` and name the sandbox afterwards with
+        ``client.update(sandbox_id, name=...)``.
+
+        Returns:
+            Connected Sandbox handle for the named sandbox.
+
+        Raises:
+            SandboxError: If the name stays claimed but its sandbox cannot
+                be attached to after several attempts (for example, the
+                previous holder is stuck terminating), or if a sandbox that
+                is still starting does not reach ``Running`` within
+                ``request_timeout``.
+            RemoteAPIError: If the create step fails with a non-409 error.
+        """
+        connect_kwargs: dict[str, Any] = {
+            "proxy_url": proxy_url,
+            "api_key": api_key,
+            "api_url": api_url,
+            "organization_id": organization_id,
+            "project_id": project_id,
+            "namespace": namespace,
+            "request_timeout": request_timeout,
+        }
+        wait_timeout = (
+            request_timeout
+            if request_timeout is not None
+            else _defaults.DEFAULT_HTTP_TIMEOUT_SEC
+        )
+        last_conflict: RemoteAPIError | None = None
+        for attempt in range(_GET_OR_CREATE_ATTEMPTS):
+            if attempt:
+                # Reachable only after a lost create race whose winner is
+                # not connectable yet (for example, the name's previous
+                # holder is still terminating). Give the server a moment.
+                time.sleep(_GET_OR_CREATE_RETRY_DELAY_SEC * attempt)
+            try:
+                try:
+                    sandbox = cls.connect(name, **connect_kwargs)
+                except SandboxNotRoutableError:
+                    # Another caller's create is still starting the sandbox,
+                    # so it has no proxy routing (sandbox_url) yet. Match
+                    # create(): wait until connect can bind to it.
+                    sandbox = cls._connect_when_routable(
+                        name, connect_kwargs, wait_timeout
+                    )
+                    if sandbox is None:
+                        # The starting sandbox disappeared or terminated;
+                        # the name may be free again.
+                        continue
+                # With an explicit proxy_url, connect skips resolution and
+                # cannot see that the name is free; this info() call is then
+                # the existence check that routes a free name to the create
+                # step below. Otherwise connect already cached the info, so
+                # this adds no request.
+                status = sandbox.info().status
+            except SandboxNotFoundError:
+                try:
+                    created = cls.create(
+                        image=image,
+                        cpus=cpus,
+                        memory_mb=memory_mb,
+                        disk_mb=disk_mb,
+                        gpus=gpus,
+                        gpu_model=gpu_model,
+                        timeout_secs=timeout_secs,
+                        entrypoint=entrypoint,
+                        allow_internet_access=allow_internet_access,
+                        allow_out=allow_out,
+                        deny_out=deny_out,
+                        snapshot_id=snapshot_id,
+                        allow_unauthenticated_access=allow_unauthenticated_access,
+                        exposed_ports=exposed_ports,
+                        proxy_url=proxy_url,
+                        request_timeout=request_timeout,
+                        name=name,
+                        file_systems=file_systems,
+                        api_key=api_key,
+                        api_url=api_url,
+                        organization_id=organization_id,
+                        project_id=project_id,
+                        namespace=namespace,
+                        gpu=gpu,
+                        max_pending_secs=max_pending_secs,
+                        auto_resume=auto_resume,
+                    )
+                except RemoteAPIError as e:
+                    if e.status_code != 409:
+                        raise
+                    # Lost the create race: another caller claimed the name
+                    # first. Loop back and attach to the winner.
+                    last_conflict = e
+                    continue
+                created._bind_outcome = "created"
+                return created
+            if status == SandboxStatus.PENDING:
+                # Another caller's create is still starting this sandbox.
+                # Match create(): block until Running, then pick up fresh
+                # proxy routing before handing the sandbox out.
+                info = sandbox._fresh_running_info_for_rebind(
+                    time.monotonic() + wait_timeout, poll_interval=0.5
+                )
+                sandbox._rebind_proxy(info)
+            elif resume and status in (
+                SandboxStatus.SUSPENDING,
+                SandboxStatus.SUSPENDED,
+            ):
+                if status == SandboxStatus.SUSPENDING:
+                    # The server rejects resume while a suspend is still in
+                    # progress; wait for the suspend to settle first.
+                    status = cls._wait_out_suspending(sandbox, wait_timeout, name)
+                if status == SandboxStatus.SUSPENDED:
+                    sandbox.resume(timeout=wait_timeout)
+                elif status == SandboxStatus.TERMINATED:
+                    # The sandbox died while suspending; the name may be
+                    # free again.
+                    continue
+                else:
+                    # Another caller resumed it first. The resumed sandbox
+                    # may live elsewhere, so this handle's routing from
+                    # before the suspend is stale. Match the PENDING
+                    # branch: block until Running with fresh proxy routing.
+                    info = sandbox._fresh_running_info_for_rebind(
+                        time.monotonic() + wait_timeout, poll_interval=0.5
+                    )
+                    sandbox._rebind_proxy(info)
+                sandbox._bind_outcome = "resumed"
+                return sandbox
+            sandbox._bind_outcome = "attached"
+            return sandbox
+        raise SandboxError(
+            f"get_or_create({name!r}): the name is claimed, but its sandbox "
+            f"could not be attached to after {_GET_OR_CREATE_ATTEMPTS} attempts"
+        ) from last_conflict
+
+    @staticmethod
+    def _wait_out_suspending(
+        sandbox: "Sandbox",
+        wait_timeout: float,
+        name: str,
+    ) -> SandboxStatus:
+        """Poll until the sandbox leaves ``Suspending``.
+
+        The lifecycle API rejects resume while a suspend is still in
+        progress, so :meth:`get_or_create` must wait for the suspend to
+        settle before it can resume the sandbox.
+
+        Raises:
+            SandboxError: If the sandbox is still ``Suspending`` after
+                ``wait_timeout`` seconds.
+        """
+        deadline = time.monotonic() + wait_timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            # info() serves the cached SUSPENDING info from connect(); the
+            # status accessor always fetches fresh state from the server.
+            status = sandbox.status
+            if status != SandboxStatus.SUSPENDING:
+                return status
+        raise SandboxError(
+            f"get_or_create({name!r}): the sandbox holding the name did not "
+            f"finish suspending within {wait_timeout}s"
+        )
+
+    @classmethod
+    def _connect_when_routable(
+        cls,
+        name: str,
+        connect_kwargs: dict[str, Any],
+        wait_timeout: float,
+    ) -> "Sandbox | None":
+        """Poll ``connect`` until the named sandbox has proxy routing.
+
+        Used by :meth:`get_or_create` when the name's sandbox is still
+        starting and has no ``sandbox_url`` yet. Returns ``None`` when the
+        sandbox disappears or terminates while starting, so the caller can
+        retry the name.
+
+        Raises:
+            SandboxError: If the sandbox does not become connectable within
+                ``wait_timeout``.
+        """
+        deadline = time.monotonic() + wait_timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            try:
+                return cls.connect(name, **connect_kwargs)
+            except SandboxNotFoundError:
+                return None
+            except SandboxNotRoutableError as e:
+                if e.status == SandboxStatus.TERMINATED:
+                    return None
+        raise SandboxError(
+            f"get_or_create({name!r}): the sandbox holding the name did not "
+            f"become connectable within {wait_timeout}s"
+        )
+
+    # --- Class-level snapshot management ---
+
+    @classmethod
+    def get_snapshot(
+        cls,
+        snapshot_id: str,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        request_timeout: float = _defaults.DEFAULT_HTTP_TIMEOUT_SEC,
+    ) -> SnapshotInfo:
+        """Get information about a snapshot by ID.
+
+        No sandbox handle is needed — snapshots are looked up directly.
+
+        Args:
+            snapshot_id: ID of the snapshot.
+            api_key: Tensorlake API key (defaults to TENSORLAKE_API_KEY env var).
+            api_url: API server URL (defaults to TENSORLAKE_API_URL env var).
+            organization_id: Organization ID for multi-tenant access.
+            project_id: Project ID for scoping resources.
+            namespace: Namespace for local-server deployments.
+
+        Returns:
+            SnapshotInfo with full snapshot details.
+        """
+        from .client import SandboxClient
+
+        client = SandboxClient(
+            api_url=api_url,
+            api_key=api_key,
+            organization_id=organization_id,
+            project_id=project_id,
+            namespace=namespace,
+            request_timeout=request_timeout,
+            _internal=True,
+        )
+        return client.get_snapshot(snapshot_id).value
+
+    @classmethod
+    def delete_snapshot(
+        cls,
+        snapshot_id: str,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        request_timeout: float = _defaults.DEFAULT_HTTP_TIMEOUT_SEC,
+    ) -> None:
+        """Delete a snapshot by ID.
+
+        No sandbox handle is needed — snapshots are deleted directly.
+
+        Args:
+            snapshot_id: ID of the snapshot to delete.
+            api_key: Tensorlake API key (defaults to TENSORLAKE_API_KEY env var).
+            api_url: API server URL (defaults to TENSORLAKE_API_URL env var).
+            organization_id: Organization ID for multi-tenant access.
+            project_id: Project ID for scoping resources.
+            namespace: Namespace for local-server deployments.
+        """
+        from .client import SandboxClient
+
+        client = SandboxClient(
+            api_url=api_url,
+            api_key=api_key,
+            organization_id=organization_id,
+            project_id=project_id,
+            namespace=namespace,
+            request_timeout=request_timeout,
+            _internal=True,
+        )
+        client.delete_snapshot(snapshot_id)
+
+    @classmethod
+    def list(
+        cls,
+        api_key: str | None = _defaults.API_KEY,
+        api_url: str = _defaults.API_URL,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        request_timeout: float = _defaults.DEFAULT_HTTP_TIMEOUT_SEC,
+    ) -> TracedIterator[SandboxInfo]:
+        """List all sandboxes in the namespace.
+
+        No sandbox handle is needed.
+
+        Args:
+            api_key: Tensorlake API key (defaults to TENSORLAKE_API_KEY env var).
+            api_url: API server URL (defaults to TENSORLAKE_API_URL env var).
+            organization_id: Organization ID for multi-tenant access.
+            project_id: Project ID for scoping resources.
+            namespace: Namespace for local-server deployments.
+
+        Returns:
+            TracedIterator[SandboxInfo] — iterable over all sandboxes.
+        """
+        from .client import SandboxClient
+
+        client = SandboxClient(
+            api_url=api_url,
+            api_key=api_key,
+            organization_id=organization_id,
+            project_id=project_id,
+            namespace=namespace,
+            request_timeout=request_timeout,
+            _internal=True,
+        )
+        return client.list()
+
+    # --- Instance lifecycle methods ---
+
+    def _require_lifecycle_client(self, operation: str) -> None:
+        if self._lifecycle_client is None:
+            raise SandboxError(
+                f"Cannot {operation}: no lifecycle client available. "
+                "Use Sandbox.create() or Sandbox.connect() to get a lifecycle-aware handle."
+            )
+
+    def suspend(
+        self,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+    ) -> None:
+        """Suspend this sandbox.
+
+        By default blocks until the sandbox is fully ``Suspended``.
+        Pass ``wait=False`` for fire-and-return (the server queues the
+        suspend but this method returns immediately).
+
+        Args:
+            wait: If True (default), poll until Suspended.
+            timeout: Max seconds to wait when wait=True (default 300).
+            poll_interval: Seconds between polls when wait=True (default 1.0).
+
+        Raises:
+            SandboxError: If the sandbox does not suspend within timeout,
+                or terminates unexpectedly.
+        """
+        self._require_lifecycle_client("suspend")
+        self._lifecycle_client.suspend(
+            self.sandbox_id, wait=wait, timeout=timeout, poll_interval=poll_interval
+        )
+
+    def resume(
+        self,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+    ) -> None:
+        """Resume this sandbox.
+
+        By default blocks until the sandbox is ``Running`` and refreshes this
+        handle's cached proxy routing. Rare transient proxy errors may still
+        occur immediately after resume.
+
+        Pass ``wait=False`` for fire-and-return. In that mode this handle's
+        cached proxy routing is not refreshed; use the default ``wait=True``
+        for immediate follow-up operations. If you intentionally use
+        ``wait=False``, wait until the sandbox is running and reconnect to get
+        fresh routing before issuing process/file/PTY operations.
+
+        Args:
+            wait: If True (default), poll until Running.
+            timeout: Max seconds to wait when wait=True (default 300).
+            poll_interval: Seconds between polls when wait=True (default 1.0).
+
+        Raises:
+            SandboxError: If the sandbox does not resume within timeout,
+                or terminates unexpectedly.
+        """
+        self._require_lifecycle_client("resume")
+        deadline = time.monotonic() + timeout
+        remaining = max(0.0, deadline - time.monotonic())
+        self._lifecycle_client.resume(
+            self._lifecycle_identifier(),
+            wait=wait,
+            timeout=remaining,
+            poll_interval=poll_interval,
+        )
+        if wait:
+            info = self._fresh_running_info_for_rebind(deadline, poll_interval)
+            self._rebind_proxy(info)
+
+    def attach_file_system(
+        self,
+        file_system_id: str,
+        mount_path: str,
+        *,
+        read_only: bool = False,
+        prefetch: bool = False,
+        snapshot_id: str | None = None,
+        owner: str | None = None,
+    ) -> Traced[SandboxInfo]:
+        """Attach a registered file system to this running sandbox.
+
+        Args:
+            file_system_id: The registered file system's name (created with
+                ``tl fs create <name>``).
+            mount_path: Absolute, unique guest mount path (e.g. ``/mnt/skills``).
+            read_only: Mount the file system read-only.
+            prefetch: Eagerly download the file system's contents.
+            snapshot_id: Pin the mount to a specific filesystem snapshot.
+                Requires ``read_only=True``.
+            owner: Present the mounted files as owned by this guest user:
+                ``NAME``, ``UID``, ``NAME:GROUP``, or ``UID:GID`` (e.g.
+                ``"agent"`` or ``"1001:1001"``), resolved against the sandbox
+                image's own user database when the mount attaches. Unset keeps
+                the image default (the baked ``tl-user`` account when the
+                image has one, otherwise root).
+
+        Returns:
+            Traced[SandboxInfo] with this sandbox's updated file systems.
+        """
+        self._require_lifecycle_client("attach_file_system")
+        traced = self._lifecycle_client.attach_file_system(
+            self._lifecycle_identifier(),
+            file_system_id,
+            mount_path,
+            read_only=read_only,
+            prefetch=prefetch,
+            snapshot_id=snapshot_id,
+            owner=owner,
+        )
+        self._sandbox_id = traced.sandbox_id
+        self._cached_info = traced.value
+        return traced
+
+    def detach_file_system(self, mount_path: str) -> Traced[SandboxInfo]:
+        """Detach the file system mounted at ``mount_path`` from this sandbox.
+
+        Args:
+            mount_path: Absolute guest mount path of the file system to
+                unmount.
+
+        Returns:
+            Traced[SandboxInfo] with this sandbox's updated file systems.
+        """
+        self._require_lifecycle_client("detach_file_system")
+        traced = self._lifecycle_client.detach_file_system(
+            self._lifecycle_identifier(), mount_path
+        )
+        self._sandbox_id = traced.sandbox_id
+        self._cached_info = traced.value
+        return traced
+
+    def list_file_systems(self) -> list[FileSystemMount]:
+        """List file systems currently mounted into this sandbox.
+
+        Returns:
+            The file systems mounted into this sandbox, each with its
+            ``file_system_id`` and guest ``mount_path``.
+        """
+        self._require_lifecycle_client("list_file_systems")
+        info = self._lifecycle_client.get(self._lifecycle_identifier()).value
+        self._sandbox_id = info.sandbox_id
+        self._cached_info = info
+        return info.file_systems
+
+    def copy(
+        self,
+        *,
+        times: int = 1,
+        request_timeout: float | None = None,
+    ) -> Traced[CopySandboxResponse]:
+        """Live-copy this running sandbox.
+
+        Args:
+            times: Number of running copies to create. Must be at least 1.
+            request_timeout: Optional HTTP request timeout in seconds for this
+                blocking copy request.
+
+        Returns:
+            Traced[CopySandboxResponse] with copy results.
+        """
+        self._require_lifecycle_client("copy")
+        return self._lifecycle_client.copy(
+            self._lifecycle_identifier(),
+            times=times,
+            request_timeout=request_timeout,
+        )
+
+    def checkpoint(
+        self,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+        checkpoint_type: CheckpointType | None = None,
+        wait_until: SnapshotWaitCondition | str = SnapshotWaitCondition.LOCAL_READY,
+    ) -> SnapshotInfo | None:
+        """Create a checkpoint of this sandbox.
+
+        By default blocks until the snapshot is locally ready and resumable.
+        Pass ``wait=False`` to
+        fire-and-return (returns ``None``).
+
+        Args:
+            wait: If True (default), poll until the requested wait condition.
+            timeout: Max seconds to wait when wait=True (default 300).
+            poll_interval: Seconds between polls when wait=True (default 1.0).
+            checkpoint_type: Optional checkpoint type.
+            wait_until: Snapshot readiness condition. Defaults to local-ready.
+
+        Returns:
+            SnapshotInfo when wait=True; None when wait=False.
+
+        Raises:
+            SandboxError: If the snapshot fails or times out.
+        """
+        self._require_lifecycle_client("checkpoint")
+        snapshot_type = (
+            SnapshotType(checkpoint_type.value) if checkpoint_type is not None else None
+        )
+        if not wait:
+            self._lifecycle_client.snapshot(
+                self.sandbox_id, snapshot_type=snapshot_type
+            )
+            return None
+        return self._lifecycle_client.snapshot_and_wait(
+            self.sandbox_id,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            snapshot_type=snapshot_type,
+            wait_until=wait_until,
+        ).value
+
+    def list_snapshots(self) -> TracedIterator[SnapshotInfo]:
+        """List snapshots taken from this sandbox.
+
+        Returns:
+            TracedIterator[SnapshotInfo] — iterable over this sandbox's snapshots.
+        """
+        self._require_lifecycle_client("list_snapshots")
+        return self._lifecycle_client.list_sandbox_snapshots(self.sandbox_id)
+
+    def get_logs(
+        self,
+        *,
+        levels: list[SandboxLogLevel | str] | None = None,
+        process_ids: list[str] | None = None,
+        next_token: str | None = None,
+        head: int | None = None,
+        tail: int | None = None,
+        body: str | None = None,
+    ) -> Traced[SandboxLogsResponse]:
+        """Read persisted logs for this sandbox."""
+        self._require_lifecycle_client("get_logs")
+        traced = self._lifecycle_client.get_logs(
+            self.sandbox_id,
+            levels=levels,
+            process_ids=process_ids,
+            next_token=next_token,
+            head=head,
+            tail=tail,
+            body=body,
+        )
+        self._trace_id = traced.trace_id
+        return traced
+
+    def list_log_processes(self) -> Traced[SandboxProcessLogFiltersResponse]:
+        """List processes available as persisted-log filters for this sandbox."""
+        self._require_lifecycle_client("list_log_processes")
+        traced = self._lifecycle_client.list_log_processes(self.sandbox_id)
+        self._trace_id = traced.trace_id
+        return traced
+
+    def _fetch_info(self) -> SandboxInfo:
+        """Fetch and cache sandbox info from the server (lazy, once per instance)."""
+        if self._cached_info is None:
+            if self._lifecycle_client is None:
+                raise SandboxError(
+                    "Cannot resolve sandbox info: no lifecycle client available. "
+                    "Connect via SandboxClient.connect() to enable sandbox_id and name lookup."
+                )
+            lookup_id = self._sandbox_id or self._identifier
+            self._cached_info = self._lifecycle_client.get(lookup_id).value
+        return self._cached_info
+
+    def info(self) -> SandboxInfo:
+        """Fetch the current sandbox information from the server on demand.
+
+        Returns:
+            SandboxInfo with the latest state from the server.
+
+        Raises:
+            SandboxError: If no lifecycle client is available.
+        """
+        self._require_lifecycle_client("info")
+        self._cached_info = self._lifecycle_client.get(
+            self._lifecycle_identifier()
+        ).value
+        self._sandbox_id = self._cached_info.sandbox_id
+        return self._cached_info
+
+    def _lifecycle_identifier(self) -> str:
+        """Best-effort stable identifier for lifecycle API calls.
+
+        Prefer a known server-assigned sandbox ID, but avoid forcing an extra
+        GET solely to resolve it.
+        """
+        if self._sandbox_id is not None:
+            return self._sandbox_id
+        if self._cached_info is not None:
+            self._sandbox_id = self._cached_info.sandbox_id
+            return self._sandbox_id
+        return self._identifier
+
+    @property
+    def sandbox_id(self) -> str:
+        """The server-assigned UUID for this sandbox."""
+        if self._sandbox_id is not None:
+            return self._sandbox_id
+        self._sandbox_id = self._fetch_info().sandbox_id
+        return self._sandbox_id
+
+    @property
+    def bind_outcome(self) -> GetOrCreateOutcome | None:
+        """What :meth:`get_or_create` did to bind the name.
+
+        ``"created"``, ``"attached"``, or ``"resumed"``; ``None`` for
+        handles from :meth:`create` or :meth:`connect`.
+        """
+        return self._bind_outcome
+
+    @property
+    def trace_id(self) -> str | None:
+        """W3C traceparent trace ID from the create/claim request, or None if not available."""
+        return self._trace_id
+
+    @property
+    def name(self) -> str | None:
+        """The human-readable name for this sandbox, or None if unnamed."""
+        return self._fetch_info().name
+
+    @name.setter
+    def name(self, value: str) -> None:
+        """Assign or change this sandbox's name. Equivalent to ``self.update(name=value)``."""
+        if not value:
+            raise SandboxError("sandbox name must be a non-empty string")
+        self.update(name=value)
+
+    @property
+    def status(self) -> SandboxStatus:
+        """Current sandbox status fetched fresh from the server."""
+        self._require_lifecycle_client("read_status")
+        info = self._lifecycle_client.get(self._lifecycle_identifier()).value
+        self._sandbox_id = info.sandbox_id
+        self._cached_info = info
+        return info.status
+
+    def update(
+        self,
+        name: str | None = None,
+        *,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+        auto_resume: bool | None = None,
+        network: NetworkConfig | ClearNetworkPolicy | None = None,
+    ) -> Traced[SandboxInfo]:
+        """Update this sandbox's properties.
+
+        Resource names and units match create. Which runtimes and dimensions
+        support a live resize is decided by the server, whose policy error is
+        raised unchanged. Resize requires a running sandbox and cannot be mixed
+        with name, proxy, or network changes. Omitted dimensions retain their
+        confirmed allocation.
+        Integer-valued floats such as 2048.0 are accepted for memory and disk;
+        fractional values and booleans are rejected without rounding.
+
+        If all targets already match, no update is sent. The returned resources
+        are current, but resource_resize can be None or describe an earlier
+        operation, including a failed one. Wait options are ignored when no
+        resource targets are supplied.
+
+        Args:
+            name: New sandbox name. Naming an ephemeral sandbox makes it
+                non-ephemeral and enables suspend/resume.
+            cpus: Finite positive whole-vCPU target, using create's CPU units.
+            memory_mb: Positive integer memory target in MiB.
+            disk_mb: Positive integer root disk target in MiB; cannot shrink
+                below the current confirmed disk size.
+            wait: Wait for resize completion (default True). False returns
+                admission; use wait_for_resource_resize() to continue later.
+            timeout: Maximum seconds to wait for resize completion (default
+                300). Does not change sandbox lifetime or cancel the resize.
+                Zero checks once. Ignored when wait is False.
+            poll_interval: Seconds between resize polls (default 1.0); must
+                be positive. Ignored when wait is False.
+            allow_unauthenticated_access: Whether exposed user ports should be
+                reachable without Tensorlake auth.
+            auto_resume: Omit to keep the current flag. False requires a named
+                sandbox. May be changed while suspended without waking it;
+                cannot be combined with resource resizing.
+            exposed_ports: User ports routable through the sandbox proxy.
+                Port 9501 is reserved for sandbox management.
+            network: Egress network policy. Omit to leave it unchanged, pass a
+                NetworkConfig to replace it atomically, or CLEAR_NETWORK_POLICY
+                to restore unrestricted egress. Unresolvable destinations
+                reject the update and leave the previous policy enforced.
+
+        Returns:
+            Traced[SandboxInfo] with confirmed resources and the latest resize
+            metadata, which may belong to an earlier operation for a no-op.
+
+        Raises:
+            SandboxResizeError: The resize failed, timed out, was interrupted,
+                was superseded, or returned incompatible completion metadata.
+                Carries generation, reason, and confirmed_resources.
+            SandboxError: Invalid targets, wait options, or mixed update fields.
+            SandboxNotFoundError: The sandbox does not exist.
+            RemoteAPIError: The API rejected the request.
+            SandboxConnectionError: The server is unreachable.
+        """
+        self._require_lifecycle_client("update")
+        resource_options = (
+            dict(
+                cpus=cpus,
+                memory_mb=memory_mb,
+                disk_mb=disk_mb,
+                wait=wait,
+                timeout=timeout,
+                poll_interval=poll_interval,
+            )
+            if any(value is not None for value in (cpus, memory_mb, disk_mb))
+            else {}
+        )
+        traced = self._lifecycle_client.update_sandbox(
+            self._lifecycle_identifier(),
+            **resource_options,
+            name=name,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=exposed_ports,
+            auto_resume=auto_resume,
+            network=network,
+        )
+        self._sandbox_id = traced.sandbox_id
+        self._cached_info = traced.value
+        return traced
+
+    def wait_for_resource_resize(
+        self,
+        generation: int,
+        *,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+    ) -> Traced[SandboxInfo]:
+        """Wait for an exact resize generation without submitting another update.
+
+        Args:
+            generation: Positive generation returned by the update or timeout error.
+            timeout: Maximum wait in seconds (default 300). Timeout never
+                cancels the resize; call this method again to keep waiting.
+                Zero checks once.
+            poll_interval: Positive seconds between polls (default 1.0).
+
+        Returns:
+            Traced[SandboxInfo] with the completed generation's confirmed resources.
+
+        Raises:
+            SandboxResizeError: Failure, timeout, interruption, superseding, or
+                incompatible metadata; includes the last confirmed_resources.
+            SandboxError: Invalid generation or wait options.
+            SandboxNotFoundError: The sandbox does not exist.
+            RemoteAPIError: The API rejected the request.
+            SandboxConnectionError: The server is unreachable.
+        """
+        self._require_lifecycle_client("wait_for_resource_resize")
+        traced = self._lifecycle_client.wait_for_resource_resize(
+            self._lifecycle_identifier(),
+            generation,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+        self._sandbox_id = traced.sandbox_id
+        self._cached_info = traced.value
+        return traced
+
+    def __enter__(self) -> Sandbox:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager.
+
+        If this sandbox was created via ``create_and_connect()``, the
+        sandbox is terminated (deleted from the server). Otherwise only
+        the client is closed and the sandbox keeps running.
+        """
+        if self._owns_sandbox:
+            self.terminate()
+        else:
+            self.close()
+
+    def close(self):
+        """Close the client connection. The sandbox keeps running."""
+        self._rust_client.close()
+
+    def terminate(self):
+        """Terminate the sandbox and close the connection."""
+        lifecycle_client = self._lifecycle_client
+        delete_identifier = self._sandbox_id or self._identifier
+        self._owns_sandbox = False
+        self._lifecycle_client = None
+        self.close()
+        if lifecycle_client is not None:
+            lifecycle_client.delete(delete_identifier)
+
+    @staticmethod
+    def _build_command_payload(
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        working_dir: str | None = None,
+        **extra: object,
+    ) -> dict:
+        """Build a process command payload dict with common fields."""
+        payload: dict = {"command": command}
+        if args is not None:
+            payload["args"] = args
+        if env is not None:
+            payload["env"] = env
+        if working_dir is not None:
+            payload["working_dir"] = working_dir
+        for key, value in extra.items():
+            if value is not None:
+                payload[key] = value
+        return payload
+
+    @staticmethod
+    def _command_result_from_run_events(events_json: list[str]) -> CommandResult:
+        """Reduce the ``POST /api/v1/processes/run`` events into a result."""
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        exit_event: dict[str, Any] | None = None
+
+        for event_json in events_json:
+            event = json.loads(event_json)
+            if "line" in event:
+                if event.get("stream") == "stderr":
+                    stderr_lines.append(event["line"])
+                else:
+                    stdout_lines.append(event["line"])
+            elif event.get("exit_code") is not None or event.get("signal") is not None:
+                exit_event = event
+
+        if exit_event is None:
+            raise SandboxConnectionError(
+                "sandbox process stream ended without an exit event"
+            )
+
+        signal = exit_event.get("signal")
+        if exit_event.get("exit_code") is not None:
+            exit_code = exit_event["exit_code"]
+        else:
+            exit_code = -signal
+
+        try:
+            reason = CommandExitReason(exit_event.get("reason"))
+        except ValueError:
+            # Sandboxes that predate the field, or a reason this SDK does not
+            # know: derive it from how the process ended. A timeout is only
+            # ever reported by the sandbox, never inferred from a SIGKILL.
+            if exit_event.get("oom_killed"):
+                reason = CommandExitReason.OOM_KILLED
+            elif exit_event.get("exit_code") is None:
+                reason = CommandExitReason.SIGNALED
+            else:
+                reason = CommandExitReason.EXITED
+
+        return CommandResult(
+            exit_code=exit_code,
+            stdout="\n".join(stdout_lines),
+            stderr="\n".join(stderr_lines),
+            reason=reason,
+        )
+
+    @staticmethod
+    def _normalize_process_user(
+        user: ProcessUser | None,
+    ) -> str | dict[str, Any] | None:
+        if user is None:
+            # Caller did not request a specific user: omit the field so the
+            # sandbox resolves the image's configured user (e.g. the image
+            # ``USER`` directive, falling back to root).
+            return None
+        if isinstance(user, str):
+            value = user
+        elif isinstance(user, ProcessUserSpec):
+            spec = user
+            value = None
+        elif isinstance(user, Mapping):
+            try:
+                spec = ProcessUserSpec.model_validate(dict(user))
+            except ValidationError as exc:
+                raise SandboxError(f"invalid process user spec: {exc}") from exc
+            value = None
+        else:
+            raise SandboxError("process user must be a string or ProcessUserSpec")
+
+        if value is not None:
+            if not value.strip():
+                raise SandboxError("process user must not be empty")
+            return value
+
+        if spec.name is not None and spec.uid is not None:
+            raise SandboxError("process user must not set both name and uid")
+        if spec.name is None and spec.uid is None:
+            raise SandboxError("process user must include name or uid")
+        payload = spec.model_dump(exclude_none=True)
+        if payload.get("name") == "":
+            raise SandboxError("process user name must not be empty")
+        return payload
+
+    @staticmethod
+    def _normalize_restart_config(
+        restart: RestartPolicyConfig | Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if restart is None:
+            return None
+        try:
+            if isinstance(restart, RestartPolicyConfig):
+                config = restart
+            elif isinstance(restart, Mapping):
+                config = RestartPolicyConfig.model_validate(dict(restart))
+            else:
+                raise SandboxError(
+                    "process restart must be a RestartPolicyConfig or dict"
+                )
+        except ValidationError as exc:
+            raise SandboxError(f"invalid process restart config: {exc}") from exc
+        return config.model_dump(mode="json", exclude_none=True)
+
+    @staticmethod
+    def _normalize_health_check(
+        health_check: ProcessHealthCheck | Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if health_check is None:
+            return None
+        try:
+            if isinstance(health_check, ProcessHealthCheck):
+                config = health_check
+            elif isinstance(health_check, Mapping):
+                config = ProcessHealthCheck.model_validate(dict(health_check))
+            else:
+                raise SandboxError(
+                    "process health_check must be a ProcessHealthCheck or dict"
+                )
+        except ValidationError as exc:
+            raise SandboxError(f"invalid process health_check config: {exc}") from exc
+        return config.model_dump(mode="json", exclude_none=True)
+
+    # --- High-level convenience ---
+
+    def run(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        working_dir: str | None = None,
+        timeout: float | None = None,
+        user: ProcessUser | None = None,
+    ) -> Traced[CommandResult]:
+        """Run a command to completion and return its output.
+
+        Uses a single streaming ``POST /api/v1/processes/run`` request that
+        starts the process, streams output, and delivers the exit code — all
+        over one HTTP connection.
+
+        Args:
+            command: Command to execute
+            args: Command arguments
+            env: Environment variables
+            working_dir: Working directory
+            timeout: Maximum seconds to wait (enforced server-side; None = no limit).
+                When it expires the daemon SIGKILLs the command's whole process
+                tree, not only the first process.
+            user: Process user. Defaults to ``None``, which runs as the image's
+                configured user (the image ``USER`` directive, falling back to
+                root). Pass a username such as ``"root"``, a Docker-style id
+                string like ``"1000:1000"``, or ``ProcessUserSpec(uid=1000, gid=1000)``.
+
+        Returns:
+            Traced[CommandResult] — access ``.trace_id`` for the W3C trace ID
+            and ``.exit_code`` / ``.stdout`` / ``.stderr`` directly (or via
+            ``.value``).
+        """
+        process_user = self._normalize_process_user(user)
+        payload = self._build_command_payload(
+            command,
+            args,
+            env,
+            working_dir,
+            timeout=timeout,
+            user=process_user,
+        )
+
+        try:
+            trace_id, events_json = self._rust_client.run_process_json(
+                json.dumps(payload)
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+        return Traced(trace_id, self._command_result_from_run_events(events_json))
+
+    # --- Process management ---
+
+    def start_process(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        working_dir: str | None = None,
+        stdin_mode: StdinMode = StdinMode.CLOSED,
+        stdout_mode: OutputMode = OutputMode.CAPTURE,
+        stderr_mode: OutputMode = OutputMode.CAPTURE,
+        user: ProcessUser | None = None,
+        name: str | None = None,
+        restart: RestartPolicyConfig | Mapping[str, Any] | None = None,
+        health_check: ProcessHealthCheck | Mapping[str, Any] | None = None,
+    ) -> Traced[ProcessInfo]:
+        """Start a new process in the sandbox.
+
+        Args:
+            command: Command to execute
+            args: Command arguments
+            env: Environment variables
+            working_dir: Working directory
+            stdin_mode: StdinMode.CLOSED or StdinMode.PIPE
+            stdout_mode: OutputMode.CAPTURE or OutputMode.DISCARD
+            stderr_mode: OutputMode.CAPTURE or OutputMode.DISCARD
+            user: Process user. Defaults to ``None``, which runs as the image's
+                configured user (the image ``USER`` directive, falling back to
+                root). Pass a username such as ``"root"``, a Docker-style id
+                string like ``"1000:1000"``, or ``ProcessUserSpec(uid=1000, gid=1000)``.
+            name: Optional managed-process name. Supplying this opts the process
+                into daemon management. Once named, the process can be addressed by this
+                name (in addition to its PID) in ``get_process``/``kill_process``/
+                ``send_signal``/etc. -- useful because a managed process's PID changes when
+                it restarts. The name may contain any characters except ``/`` and must not
+                be all digits (numeric strings are reserved for PID addressing). If omitted,
+                the daemon assigns an opaque id (exposed as ``ProcessInfo.managed.id``) and
+                the process is addressable only by its current PID.
+            restart: Optional restart policy. Supplying this opts the process
+                into daemon management.
+            health_check: Optional HTTP or TCP health check. Supplying this opts
+                the process into daemon management.
+
+        Returns:
+            Traced[ProcessInfo] — access ``.trace_id`` for the W3C trace ID
+            and ``.pid`` / ``.status`` directly (or via ``.value``).
+        """
+        if name is not None:
+            _validate_managed_name_client_side(name)
+        process_user = self._normalize_process_user(user)
+        restart_payload = self._normalize_restart_config(restart)
+        health_check_payload = self._normalize_health_check(health_check)
+        payload = self._build_command_payload(
+            command,
+            args,
+            env,
+            working_dir,
+            stdin_mode=stdin_mode if stdin_mode != StdinMode.CLOSED else None,
+            stdout_mode=stdout_mode if stdout_mode != OutputMode.CAPTURE else None,
+            stderr_mode=stderr_mode if stderr_mode != OutputMode.CAPTURE else None,
+            user=process_user,
+            name=name,
+            restart=restart_payload,
+            health_check=health_check_payload,
+        )
+
+        try:
+            trace_id, response_json = self._rust_client.start_process_json(
+                json.dumps(payload)
+            )
+            return Traced(trace_id, ProcessInfo.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def list_processes(self) -> TracedIterator[ProcessInfo]:
+        """List all processes in the sandbox."""
+        try:
+            trace_id, response_json = self._rust_client.list_processes_json()
+            data = ListProcessesResponse.model_validate_json(response_json)
+            return TracedIterator(trace_id, data.processes)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def get_process(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[ProcessInfo]:
+        """Get information about a specific process.
+
+        Args:
+            process: PID or process name given on creation.
+        """
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, response_json = self._rust_client.get_process_json(seg)
+            return Traced(trace_id, ProcessInfo.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def kill_process(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[None]:
+        """Kill a process and everything it started.
+
+        The daemon tears the process down as one unit. An unmanaged process's
+        whole process group is SIGKILLed at once, including children that
+        detached with ``setsid``. For a managed process this stops the whole
+        supervisor (it will not be restarted) gracefully: SIGTERM to the
+        process group, then SIGKILL once the process's ``stop_grace_ms``
+        (default 10 s) has elapsed.
+
+        Args:
+            process: PID or process name given on creation.
+        """
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id = self._rust_client.kill_process(seg)
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def restart_process(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[ProcessInfo]:
+        """Restart a managed process.
+
+        Args:
+            process: PID or process name given on creation.
+        """
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, response_json = self._rust_client.restart_process_json(seg)
+            return Traced(trace_id, ProcessInfo.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def send_signal(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        signal: int = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[SendSignalResponse]:
+        """Send a signal to a process and everything it started.
+
+        The signal is delivered to the process's whole process group, as a
+        terminal's job control would; SIGKILL also reaps children that
+        detached with ``setsid``. There is no escalation: a process that
+        ignores SIGTERM keeps running.
+
+        Args:
+            process: PID or process name given on creation.
+            signal: Signal number (e.g. 15 for SIGTERM, 9 for SIGKILL)
+        """
+        seg = _resolve_process_arg(process, pid)
+        if signal is _PROCESS_ARG_UNSET:
+            raise TypeError("missing required argument: `signal`")
+        try:
+            trace_id, response_json = self._rust_client.send_signal_json(seg, signal)
+            return Traced(
+                trace_id, SendSignalResponse.model_validate_json(response_json)
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    # --- Process I/O ---
+
+    def write_stdin(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        data: bytes = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[None]:
+        """Write data to a process's stdin.
+
+        Args:
+            process: PID or process name given on creation.
+            data: Bytes to write to stdin.
+        """
+        seg = _resolve_process_arg(process, pid)
+        if data is _PROCESS_ARG_UNSET:
+            raise TypeError("missing required argument: `data`")
+        try:
+            trace_id = self._rust_client.write_stdin(seg, data)
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def close_stdin(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[None]:
+        """Close a process's stdin.
+
+        Args:
+            process: PID or process name given on creation.
+        """
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id = self._rust_client.close_stdin(seg)
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def get_stdout(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[OutputResponse]:
+        """Get all stdout output from a process.
+
+        Args:
+            process: PID or process name given on creation.
+        """
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, response_json = self._rust_client.get_stdout_json(seg)
+            return Traced(trace_id, OutputResponse.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def get_stderr(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[OutputResponse]:
+        """Get all stderr output from a process.
+
+        Args:
+            process: PID or process name given on creation.
+        """
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, response_json = self._rust_client.get_stderr_json(seg)
+            return Traced(trace_id, OutputResponse.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def get_output(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> Traced[OutputResponse]:
+        """Get all combined output from a process.
+
+        Args:
+            process: PID or process name given on creation.
+        """
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, response_json = self._rust_client.get_output_json(seg)
+            return Traced(trace_id, OutputResponse.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def follow_stdout(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> TracedIterator[OutputEvent]:
+        """Collect all stdout output events from a process and return them as an iterable.
+
+        Args:
+            process: PID or process name given on creation.
+
+        Blocks until the process exits and all output has been received."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, events_json = self._rust_client.follow_stdout_json(seg)
+            return TracedIterator(
+                trace_id,
+                [OutputEvent.model_validate_json(ej) for ej in events_json],
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def follow_stderr(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> TracedIterator[OutputEvent]:
+        """Collect all stderr output events from a process and return them as an iterable.
+
+        Args:
+            process: PID or process name given on creation.
+
+        Blocks until the process exits and all output has been received."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, events_json = self._rust_client.follow_stderr_json(seg)
+            return TracedIterator(
+                trace_id,
+                [OutputEvent.model_validate_json(ej) for ej in events_json],
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def follow_output(
+        self,
+        process: int | str = _PROCESS_ARG_UNSET,
+        *,
+        pid: int | str = _PROCESS_ARG_UNSET,
+    ) -> TracedIterator[OutputEvent]:
+        """Collect all combined output events from a process and return them as an iterable.
+
+        Args:
+            process: PID or process name given on creation.
+
+        Blocks until the process exits and all output has been received."""
+        seg = _resolve_process_arg(process, pid)
+        try:
+            trace_id, events_json = self._rust_client.follow_output_json(seg)
+            return TracedIterator(
+                trace_id,
+                [OutputEvent.model_validate_json(ej) for ej in events_json],
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    # --- File operations ---
+
+    def read_file(self, path: str) -> Traced[bytes]:
+        """Read a file from the sandbox.
+
+        Args:
+            path: Absolute path inside the sandbox
+
+        Returns:
+            Traced[bytes] — access ``.trace_id`` for the W3C trace ID and
+            ``.value`` for the raw file bytes.
+        """
+        try:
+            trace_id, data = self._rust_client.read_file_bytes(path=path)
+            return Traced(trace_id, data)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def write_file(self, path: str, content: bytes) -> Traced[None]:
+        """Write a file to the sandbox.
+
+        Args:
+            path: Absolute path inside the sandbox
+            content: File contents as bytes
+        """
+        try:
+            trace_id = self._rust_client.write_file(path=path, content=content)
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def upload_file(
+        self, local_path: str | os.PathLike[str], path: str
+    ) -> Traced[None]:
+        """Stream a local file into the sandbox.
+
+        Args:
+            local_path: Local file path to upload
+            path: Absolute destination path inside the sandbox
+        """
+        try:
+            trace_id = self._rust_client.upload_file(
+                path=path, local_path=os.fspath(local_path)
+            )
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def delete_file(self, path: str) -> Traced[None]:
+        """Delete a file from the sandbox.
+
+        Args:
+            path: Absolute path inside the sandbox
+        """
+        try:
+            trace_id = self._rust_client.delete_file(path=path)
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def list_directory(self, path: str) -> Traced[ListDirectoryResponse]:
+        """List contents of a directory in the sandbox.
+
+        Args:
+            path: Absolute path inside the sandbox
+
+        Returns:
+            Traced[ListDirectoryResponse] — access ``.trace_id`` for the W3C
+            trace ID and ``.path`` / ``.entries`` directly (or via ``.value``).
+        """
+        try:
+            trace_id, response_json = self._rust_client.list_directory_json(path=path)
+            return Traced(
+                trace_id, ListDirectoryResponse.model_validate_json(response_json)
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    # --- PTY sessions ---
+
+    def create_pty_session(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        working_dir: str | None = None,
+        rows: int = 24,
+        cols: int = 80,
+    ) -> Traced[dict]:
+        """Create an interactive PTY session.
+
+        Returns a Traced dict with ``session_id`` and ``token`` for WebSocket
+        connection via :meth:`pty_ws_url`.
+        """
+        payload: dict = {"command": command, "rows": rows, "cols": cols}
+        if args is not None:
+            payload["args"] = args
+        if env is not None:
+            payload["env"] = env
+        if working_dir is not None:
+            payload["working_dir"] = working_dir
+
+        try:
+            trace_id, response_json = self._rust_client.create_pty_session_json(
+                json.dumps(payload)
+            )
+            return Traced(trace_id, json.loads(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def pty_ws_url(self, session_id: str, token: str) -> str:
+        """Construct the WebSocket URL for a PTY session.
+
+        The token is NOT included in the URL query string to avoid leaking it
+        into proxy/CDN access logs. Callers should send the token via the
+        ``X-PTY-Token`` header on the WebSocket upgrade request instead.
+        """
+        base = self._base_url.rstrip("/")
+        if base.startswith("https://"):
+            ws_base = "wss://" + base[8:]
+        elif base.startswith("http://"):
+            ws_base = "ws://" + base[7:]
+        else:
+            ws_base = base
+        return f"{ws_base}/api/v1/pty/{session_id}/ws"
+
+    def connect_pty(
+        self,
+        session_id: str,
+        token: str,
+        *,
+        on_data=None,
+        on_exit=None,
+        connect_timeout: float = 10.0,
+    ):
+        """Attach to an existing PTY session and return a high-level handle."""
+        from .pty import build_pty_connection
+
+        pty = build_pty_connection(
+            session_id=session_id,
+            token=token,
+            ws_url=self.pty_ws_url(session_id, token),
+            http_url=f"{self._base_url.rstrip('/')}/api/v1/pty/{session_id}",
+            ws_headers=self._proxy_headers,
+            http_headers=self._proxy_headers,
+            connect_timeout=connect_timeout,
+        )
+        if on_data is not None:
+            pty.on_data(on_data)
+        if on_exit is not None:
+            pty.on_exit(on_exit)
+        return pty.connect()
+
+    def _delete_pty_session(self, session_id: str, *, timeout: float = 10.0) -> None:
+        response = httpx.delete(
+            f"{self._base_url.rstrip('/')}/api/v1/pty/{session_id}",
+            headers=inject_traceparent(self._proxy_headers),
+            timeout=timeout,
+        )
+        if response.is_success or response.status_code == 404:
+            return
+        raise RemoteAPIError(response.status_code, response.text)
+
+    def create_pty(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        working_dir: str | None = None,
+        rows: int = 24,
+        cols: int = 80,
+        *,
+        on_data=None,
+        on_exit=None,
+        connect_timeout: float = 10.0,
+    ):
+        """Create a PTY session, connect immediately, and return its handle."""
+        traced_session = self.create_pty_session(
+            command=command,
+            args=args,
+            env=env,
+            working_dir=working_dir,
+            rows=rows,
+            cols=cols,
+        )
+        session = traced_session.value
+        try:
+            return self.connect_pty(
+                session["session_id"],
+                session["token"],
+                on_data=on_data,
+                on_exit=on_exit,
+                connect_timeout=connect_timeout,
+            )
+        except Exception:
+            try:
+                self._delete_pty_session(session["session_id"], timeout=connect_timeout)
+            except Exception:
+                pass
+            raise
+
+    def create_tunnel(
+        self,
+        remote_port: int,
+        *,
+        local_host: str = DEFAULT_LOCAL_HOST,
+        local_port: int | None = None,
+        connect_timeout: float = DEFAULT_TUNNEL_CONNECT_TIMEOUT,
+    ) -> TcpTunnel:
+        """Open a TCP tunnel to a port inside the sandbox and return the local listener.
+
+        Each connection to ``local_host:local_port`` is relayed to
+        ``remote_port`` inside the sandbox. ``local_port`` defaults to
+        ``remote_port``; pass ``0`` to bind an ephemeral port. Close the
+        returned :class:`~tensorlake.sandbox.TcpTunnel` when done.
+        """
+        return TcpTunnel.listen(
+            base_url=self._base_url,
+            ws_headers=self._proxy_headers,
+            remote_port=remote_port,
+            local_host=local_host,
+            local_port=local_port,
+            connect_timeout=connect_timeout,
+        )
+
+    def connect_desktop(
+        self,
+        port: int = 5901,
+        password: str | None = None,
+        shared: bool = True,
+        connect_timeout: float = 10.0,
+    ):
+        """Connect to a sandbox VNC session for programmatic desktop control."""
+        from .desktop import Desktop
+
+        if RustCloudSandboxDesktopClient is None:
+            raise SandboxError(
+                "Rust Cloud SDK desktop client is required but unavailable. "
+                "Build/install it with `make build_rust_py_client`."
+            )
+
+        try:
+            rust_client = RustCloudSandboxDesktopClient(
+                proxy_url=self._proxy_url,
+                sandbox_id=self._identifier,
+                port=port,
+                password=password,
+                shared=shared,
+                connect_timeout_sec=connect_timeout,
+                api_key=self._api_key,
+                organization_id=self._organization_id,
+                project_id=self._project_id,
+                user_agent=USER_AGENT,
+            )
+            return Desktop(rust_client)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    # --- Health and info ---
+
+    def health(self) -> Traced[HealthResponse]:
+        """Check the container daemon health."""
+        try:
+            trace_id, response_json = self._rust_client.health_json()
+            return Traced(trace_id, HealthResponse.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def daemon_info(self) -> Traced[DaemonInfo]:
+        """Get container daemon info (version, uptime, process counts)."""
+        try:
+            trace_id, response_json = self._rust_client.info_json()
+            return Traced(trace_id, DaemonInfo.model_validate_json(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)

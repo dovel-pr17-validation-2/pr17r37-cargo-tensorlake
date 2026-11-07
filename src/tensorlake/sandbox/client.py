@@ -1,0 +1,2392 @@
+"""Client SDK for managing Tensorlake sandboxes."""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+import warnings
+from collections.abc import Callable
+from typing import Any, Literal, NoReturn, overload
+from urllib.parse import urlparse
+
+from tensorlake._tracing import USER_AGENT, Traced, TracedIterator
+
+from . import _defaults
+from ._resize import resize_resources, validate_resize_wait
+from .exceptions import (
+    PoolInUseError,
+    PoolNotFoundError,
+    RemoteAPIError,
+    SandboxConnectionError,
+    SandboxError,
+    SandboxNotFoundError,
+    SandboxNotRoutableError,
+    SandboxPending,
+    SandboxResizeError,
+    _format_error_details,
+)
+from .models import (
+    CLEAR_NETWORK_POLICY,
+    ArchivedSandboxInfo,
+    ClaimSandboxRequest,
+    ClearNetworkPolicy,
+    CopySandboxResponse,
+    CreateSandboxPoolResponse,
+    CreateSandboxRequest,
+    CreateSandboxResources,
+    CreateSandboxResponse,
+    CreateSnapshotResponse,
+    FileSystemMount,
+    GpuModel,
+    GpuRequest,
+    ListArchivedSandboxesResponse,
+    ListSandboxesResponse,
+    ListSandboxPoolsResponse,
+    ListSnapshotsResponse,
+    NetworkConfig,
+    PendingSandbox,
+    ResizeErrorReason,
+    SandboxInfo,
+    SandboxLogLevel,
+    SandboxLogsResponse,
+    SandboxPoolInfo,
+    SandboxPoolRequest,
+    SandboxPortAccess,
+    SandboxProcessLogFiltersResponse,
+    SandboxStatus,
+    SnapshotInfo,
+    SnapshotStatus,
+    SnapshotType,
+    SnapshotWaitCondition,
+    UpdateSandboxRequest,
+    _validate_mount_owners,
+    _validate_mount_snapshot_pins,
+    snapshot_satisfies_wait_condition,
+)
+
+# Interval between ``GET /sandboxes/{id}`` polls while waiting for a sandbox
+# to run (ADR 0086).
+DEFAULT_WAIT_POLL_INTERVAL_SEC: float = 2.0
+
+
+def _normalize_log_levels(
+    levels: list[SandboxLogLevel | str] | None,
+) -> list[str]:
+    if levels is None:
+        return []
+    return [
+        level.value if isinstance(level, SandboxLogLevel) else str(level)
+        for level in levels
+    ]
+
+
+try:
+    from tensorlake._cloud_sdk import CloudSandboxClient as RustCloudSandboxClient
+    from tensorlake._cloud_sdk import (
+        CloudSandboxClientError as RustCloudSandboxClientError,
+    )
+
+    _RUST_SANDBOX_CLIENT_AVAILABLE = True
+except Exception:
+    try:
+        from _cloud_sdk import CloudSandboxClient as RustCloudSandboxClient
+        from _cloud_sdk import CloudSandboxClientError as RustCloudSandboxClientError
+
+        _RUST_SANDBOX_CLIENT_AVAILABLE = True
+    except Exception:
+        RustCloudSandboxClient = None
+        RustCloudSandboxClientError = None
+        _RUST_SANDBOX_CLIENT_AVAILABLE = False
+
+
+def _parse_rust_client_error_fields(
+    e: Exception,
+) -> tuple[str | None, int | None, str]:
+    kind: str | None = None
+    status_code: int | None = None
+    message = str(e)
+
+    if len(e.args) == 3:
+        kind, status_code, message = e.args
+    elif len(e.args) == 1 and isinstance(e.args[0], tuple) and len(e.args[0]) == 3:
+        kind, status_code, message = e.args[0]
+
+    return kind, status_code, message
+
+
+def _rust_status_code(e: Exception) -> int | None:
+    if (
+        RustCloudSandboxClientError is not None
+        and isinstance(e, RustCloudSandboxClientError)
+        and len(e.args) > 0
+    ):
+        _, status_code, _ = _parse_rust_client_error_fields(e)
+        return status_code
+    return None
+
+
+def _resolve_sandbox_identifier(
+    identifier: str | None,
+    sandbox_id: str | None,
+    *,
+    parameter_name: str,
+) -> str:
+    if identifier and sandbox_id and identifier != sandbox_id:
+        raise SandboxError(
+            f"Provide only one of `{parameter_name}` or `sandbox_id`, not both."
+        )
+
+    resolved = identifier or sandbox_id
+    if not resolved:
+        raise SandboxError(
+            f"`{parameter_name}` is required. `sandbox_id` is accepted as a deprecated alias."
+        )
+    return resolved
+
+
+def _explicit_proxy_url_override() -> str | None:
+    explicit = os.getenv("TENSORLAKE_SANDBOX_PROXY_URL")
+    if explicit is None:
+        return None
+    explicit = explicit.strip()
+    return explicit or None
+
+
+def _raise_as_sandbox_error(e: Exception) -> NoReturn:
+    if isinstance(e, SandboxError):
+        raise
+
+    if (
+        RustCloudSandboxClientError is not None
+        and isinstance(e, RustCloudSandboxClientError)
+        and len(e.args) > 0
+    ):
+        kind, status_code, message = _parse_rust_client_error_fields(e)
+        if kind == "resize":
+            payload = json.loads(message)
+            raise SandboxResizeError(
+                payload["sandbox_id"],
+                generation=payload["generation"],
+                reason=ResizeErrorReason(payload["reason"]),
+                message=payload["message"],
+                info=(
+                    SandboxInfo.model_validate(payload["info"])
+                    if payload.get("info") is not None
+                    else None
+                ),
+            ) from None
+        if kind == "connection":
+            raise SandboxConnectionError(message) from None
+        if status_code is not None:
+            raise RemoteAPIError(status_code, message) from None
+        raise SandboxError(message) from None
+
+    raise SandboxError(str(e)) from e
+
+
+def _build_gpu_resources(
+    gpus: int | None,
+    gpu_model: GpuModel | str | None,
+    gpu: GpuRequest | None = None,
+) -> list[GpuRequest] | None:
+    if gpu is not None:
+        if gpus is not None or gpu_model is not None:
+            raise SandboxError("gpu cannot be combined with gpus or gpu_model")
+        return [gpu]
+    if gpus is None:
+        if gpu_model is None:
+            return None
+        gpus = 1
+    if isinstance(gpus, bool) or not isinstance(gpus, int) or gpus < 1:
+        raise SandboxError("gpus must be a positive integer")
+    gpu_model = "A10" if gpu_model is None else gpu_model
+    try:
+        model = GpuModel(gpu_model)
+    except ValueError:
+        supported = ", ".join(model.value for model in GpuModel)
+        raise SandboxError(
+            f"unsupported GPU model {gpu_model!r}; expected one of: {supported}"
+        ) from None
+    return [GpuRequest(count=gpus, model=model)]
+
+
+def _unsupported_request_timeout_kwarg(e: TypeError) -> bool:
+    return "request_timeout_sec" in str(e)
+
+
+_RESERVED_SANDBOX_MANAGEMENT_PORT = 9501
+
+
+def _normalize_user_ports(ports: list[int]) -> list[int]:
+    normalized: set[int] = set()
+    for port in ports:
+        if isinstance(port, bool) or not isinstance(port, int):
+            raise SandboxError(f"invalid port '{port}'")
+        if port < 1 or port > 65535:
+            raise SandboxError(f"invalid port '{port}'")
+        if port == _RESERVED_SANDBOX_MANAGEMENT_PORT:
+            raise SandboxError("port 9501 is reserved for sandbox management")
+        normalized.add(port)
+    return sorted(normalized)
+
+
+def _startup_failure_message(
+    sandbox_id: str,
+    status: SandboxStatus | str,
+    *,
+    error_details: object | None = None,
+    termination_reason: str | None = None,
+) -> str:
+    status_value = status.value if isinstance(status, SandboxStatus) else str(status)
+    prefix = (
+        f"Sandbox {sandbox_id} terminated during startup"
+        if status_value == SandboxStatus.TERMINATED.value
+        else f"Sandbox {sandbox_id} became {status_value} during startup"
+    )
+    if termination_reason:
+        prefix += f" ({termination_reason})"
+    detail = _format_error_details(error_details)
+    if detail:
+        return f"{prefix}: {detail}"
+    return prefix
+
+
+def _startup_failure(
+    sandbox_id: str,
+    status: SandboxStatus | str,
+    *,
+    error_details: object | None = None,
+    termination_reason: str | None = None,
+) -> SandboxError:
+    """A ``SandboxError`` for a sandbox that settled somewhere other than
+    ``running`` while a caller waited for it, with the server's reason."""
+    return SandboxError(
+        _startup_failure_message(
+            sandbox_id,
+            status,
+            error_details=error_details,
+            termination_reason=termination_reason,
+        ),
+        reason=termination_reason,
+        sandbox_id=sandbox_id,
+    )
+
+
+def _build_create_request(
+    *,
+    image: str | None,
+    cpus: float | None,
+    memory_mb: int | None,
+    disk_mb: int | None,
+    gpus: int | None,
+    gpu_model: GpuModel | str | None,
+    timeout_secs: int | None,
+    entrypoint: list[str] | None,
+    allow_internet_access: bool,
+    allow_out: list[str] | None,
+    deny_out: list[str] | None,
+    snapshot_id: str | None,
+    name: str | None,
+    file_systems: list[FileSystemMount] | None,
+    gpu: GpuRequest | None,
+    max_pending_secs: int | None,
+    wait: bool | None = None,
+    auto_resume: bool | None = None,
+    allow_unauthenticated_access: bool | None = None,
+    exposed_ports: list[int] | None = None,
+) -> CreateSandboxRequest:
+    """Validate create arguments and build the wire request. Shared by the
+    sync and async clients so both send byte-identical bodies. ``wait`` is
+    sent only when ``False`` so older servers keep accepting the body."""
+    _validate_mount_snapshot_pins(file_systems)
+    _validate_mount_owners(file_systems)
+    if max_pending_secs is not None and (
+        isinstance(max_pending_secs, bool)
+        or not isinstance(max_pending_secs, int)
+        or max_pending_secs < 0
+    ):
+        raise SandboxError("max_pending_secs must be a non-negative integer")
+    network = None
+    if not allow_internet_access or allow_out is not None or deny_out is not None:
+        network = NetworkConfig(
+            allow_internet_access=allow_internet_access,
+            allow_out=allow_out or [],
+            deny_out=deny_out or [],
+        )
+
+    # A memory snapshot can only be restored with its original resources.
+    # Omitted resource arguments therefore mean "inherit" for restores,
+    # while fresh creates retain the SDK's historical defaults.
+    if snapshot_id is None:
+        cpus = 1.0 if cpus is None else cpus
+        memory_mb = 1024 if memory_mb is None else memory_mb
+    resources = CreateSandboxResources(
+        cpus=cpus,
+        memory_mb=memory_mb,
+        disk_mb=disk_mb,
+        gpus=_build_gpu_resources(gpus, gpu_model, gpu),
+    )
+    if all(value is None for value in resources.model_dump().values()):
+        resources = None
+
+    return CreateSandboxRequest(
+        image=image,
+        resources=resources,
+        timeout_secs=timeout_secs,
+        entrypoint=entrypoint,
+        network=network,
+        snapshot_id=snapshot_id,
+        allow_unauthenticated_access=allow_unauthenticated_access,
+        exposed_ports=(
+            _normalize_user_ports(exposed_ports) if exposed_ports is not None else None
+        ),
+        name=name,
+        file_systems=file_systems,
+        wait=False if wait is False else None,
+        max_pending_secs=max_pending_secs,
+        auto_resume=auto_resume,
+    )
+
+
+def _remaining_budget(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+def _pool_update_request_json(
+    request_model: SandboxPoolRequest,
+    network: NetworkConfig | ClearNetworkPolicy | None,
+) -> str:
+    """Serialize a pool update, preserving the tri-state ``network`` contract.
+
+    ``exclude_none`` drops an unset policy so the service keeps the pool's
+    current one, while :data:`CLEAR_NETWORK_POLICY` has to reach the wire as an
+    explicit JSON ``null`` to remove it.
+    """
+    payload = json.loads(request_model.model_dump_json(exclude_none=True))
+    if network is CLEAR_NETWORK_POLICY:
+        payload["network"] = None
+    return json.dumps(payload)
+
+
+class SandboxClient:
+    """Client for managing Tensorlake sandboxes and sandbox pools.
+
+    Use the ``for_cloud`` or ``for_localhost`` class methods for
+    clearer construction depending on your deployment target.
+    """
+
+    def __init__(
+        self,
+        api_url: str = _defaults.API_URL,
+        api_key: str | None = _defaults.API_KEY,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = _defaults.NAMESPACE,
+        max_retries: int = _defaults.MAX_RETRIES,
+        retry_backoff_sec: float = _defaults.RETRY_BACKOFF_SEC,
+        request_timeout: float = _defaults.DEFAULT_HTTP_TIMEOUT_SEC,
+        _internal: bool = False,
+    ):
+        if not _internal:
+            warnings.warn(
+                "SandboxClient is deprecated; use Sandbox.create() / Sandbox.connect() instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self._api_url: str = api_url
+        self._api_key: str | None = api_key
+        self._organization_id: str | None = organization_id
+        self._project_id: str | None = project_id
+        self._namespace: str | None = namespace
+        self._max_retries = max_retries
+        self._retry_backoff_sec = retry_backoff_sec
+        self._request_timeout = request_timeout
+        if not _RUST_SANDBOX_CLIENT_AVAILABLE:
+            raise SandboxError(
+                "Rust Cloud SDK sandbox client is required but unavailable. "
+                "Build/install it with `make build_rust_py_client`."
+            )
+
+        kwargs = {
+            "api_url": self._api_url,
+            "api_key": self._api_key,
+            "organization_id": self._organization_id,
+            "project_id": self._project_id,
+            "namespace": self._namespace,
+            "user_agent": USER_AGENT,
+            "request_timeout_sec": self._request_timeout,
+        }
+        try:
+            try:
+                self._rust_client = RustCloudSandboxClient(**kwargs)
+            except TypeError as e:
+                if not _unsupported_request_timeout_kwarg(e):
+                    raise
+                kwargs.pop("request_timeout_sec")
+                self._rust_client = RustCloudSandboxClient(**kwargs)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    @classmethod
+    def for_cloud(
+        cls,
+        api_key: str | None = _defaults.API_KEY,
+        organization_id: str | None = None,
+        project_id: str | None = None,
+        api_url: str = "https://api.tensorlake.ai",
+        request_timeout: float = _defaults.DEFAULT_HTTP_TIMEOUT_SEC,
+    ) -> "SandboxClient":
+        """Create a client for the Tensorlake cloud platform.
+
+        The API key is the complete cloud SDK contract: ingress authenticates it and selects the
+        authorized organization/project. Explicit scope remains available only as a low-level
+        compatibility override and is forwarded as headers without client-side discovery. The
+        *namespace* parameter is not used.
+
+        Args:
+            api_key: Tensorlake API key (defaults to TENSORLAKE_API_KEY env var)
+            organization_id: Optional explicit organization header override
+            project_id: Optional explicit project header override
+            api_url: Cloud API URL override
+        """
+        return cls(
+            api_url=api_url,
+            api_key=api_key,
+            organization_id=organization_id,
+            project_id=project_id,
+            request_timeout=request_timeout,
+        )
+
+    @classmethod
+    def for_localhost(
+        cls,
+        api_url: str = "http://localhost:8900",
+        namespace: str = "default",
+        request_timeout: float = _defaults.DEFAULT_HTTP_TIMEOUT_SEC,
+    ) -> "SandboxClient":
+        """Create a client for a local Indexify server.
+
+        Locally, resources are scoped by *namespace* which is embedded
+        in the URL path (``/v1/namespaces/{ns}/...``).
+
+        Args:
+            api_url: Local server URL
+            namespace: Namespace for resource scoping
+        """
+        return cls(
+            api_url=api_url, namespace=namespace, request_timeout=request_timeout
+        )
+
+    def __enter__(self) -> "SandboxClient":
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()
+
+    def close(self):
+        """Close the HTTP client."""
+        self._rust_client.close()
+
+    def _is_localhost(self) -> bool:
+        """Check whether the API URL points to a local server.
+
+        This determines URL routing: local servers use namespace-scoped
+        paths (``/v1/namespaces/{ns}/...``), while the cloud API uses
+        flat paths with auth headers for scoping.
+        """
+        parsed = urlparse(self._api_url)
+        return parsed.hostname in ("localhost", "127.0.0.1")
+
+    def _resolve_proxy_url(self) -> str:
+        """Resolve the legacy default proxy URL for direct sandbox handles.
+
+        Normal connect/create flows use the server-returned ``sandbox_url``.
+        ``TENSORLAKE_SANDBOX_PROXY_URL`` remains an explicit override.
+        """
+        import os
+
+        explicit = os.getenv("TENSORLAKE_SANDBOX_PROXY_URL")
+        if explicit:
+            return explicit
+        if self._is_localhost():
+            return "http://localhost:9443"
+        parsed = urlparse(self._api_url)
+        host = parsed.hostname or ""
+        if host.startswith("api."):
+            proxy_host = "sandbox." + host[4:]
+            return f"{parsed.scheme}://{proxy_host}"
+        return _defaults.SANDBOX_PROXY_URL
+
+    def _with_request_timeout(self, request_timeout: float) -> "SandboxClient":
+        if request_timeout == self._request_timeout:
+            return self
+        return SandboxClient(
+            api_url=self._api_url,
+            api_key=self._api_key,
+            organization_id=self._organization_id,
+            project_id=self._project_id,
+            namespace=self._namespace,
+            max_retries=self._max_retries,
+            retry_backoff_sec=self._retry_backoff_sec,
+            request_timeout=request_timeout,
+            _internal=True,
+        )
+
+    @overload
+    def create(
+        self,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        snapshot_id: str | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        wait: Literal[True] = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> Traced[CreateSandboxResponse]: ...
+
+    @overload
+    def create(
+        self,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        snapshot_id: str | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        *,
+        wait: Literal[False],
+        auto_resume: bool | None = None,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> PendingSandbox: ...
+
+    def create(
+        self,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        snapshot_id: str | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        wait: bool = True,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> "Traced[CreateSandboxResponse] | PendingSandbox":
+        """Create a new standalone sandbox.
+
+        With ``wait=True`` (the default) the server waits for readiness for
+        at most the request timeout and answers the blocking create's
+        record (``status`` may already be ``running``); this is the wire
+        behaviour unchanged. With ``wait=False`` the server answers as soon
+        as the sandbox is durable and this returns a :class:`PendingSandbox`
+        at once: call ``.ready()`` to wait for it, ``.status()`` to look at
+        it, or ``connect(sandbox_id)`` from any other process. The sandbox
+        starts whenever capacity allows. Give it a ``name`` when a retry of
+        this call must not create a second one: a repeated name is an HTTP
+        409, and :meth:`Sandbox.get_or_create` resolves it.
+
+        Args:
+            image: Sandbox image name to boot from, such as
+                ``tensorlake/ubuntu-minimal`` or a registered Sandbox Image name.
+                When omitted, Tensorlake uses the default managed environment.
+            cpus: Number of CPUs to allocate. Defaults to 1 for a fresh
+                sandbox; omitted snapshot restores inherit this value.
+            memory_mb: Memory in MiB. Defaults to 1024 for a fresh
+                sandbox; omitted snapshot restores inherit this value.
+            disk_mb: Root disk size in MiB. When omitted, the server
+                uses its default disk size.
+            gpus: Number of GPUs to allocate. When provided, defaults to
+                ``A10`` unless ``gpu_model`` is set. GPU CAS sandboxes require a
+                CAS image; when ``image`` is omitted, the server selects its
+                configured GPU default.
+            gpu_model: GPU model to allocate. Accepts any :class:`GpuModel` value.
+                Defaults to one GPU when ``gpus`` is omitted.
+            gpu: Typed GPU model and count request. Cannot be combined with
+                ``gpus`` or ``gpu_model``.
+            timeout_secs: Timeout in seconds (optional)
+            entrypoint: Custom entrypoint command (optional)
+            allow_internet_access: A simple switch while *allow_out* is
+                empty: True (the default) allows all outbound traffic
+                except *deny_out* matches; False blocks all egress,
+                including DNS. A non-empty *allow_out* is default-deny in
+                both modes; the flag then only controls whether the
+                sandbox's DNS resolver is implicitly allowed (True) or
+                must itself be listed in *allow_out* (False).
+            allow_out: Destinations to allow: IPs, CIDRs, or hostnames
+                (e.g. ``["8.8.8.8", "10.0.0.0/8", "api.example.com"]``).
+                When non-empty, all unlisted destinations are blocked.
+                Overridden by any matching *deny_out* entry.
+            deny_out: Destinations to deny: IPs, CIDRs, or hostnames
+                (e.g. ``["192.168.1.0/24"]``). Takes precedence over
+                *allow_out*.
+            snapshot_id: ID of a completed snapshot to restore from.
+                When set, image, resources, and entrypoint are
+                inherited from the snapshot unless explicitly
+                overridden.
+            name: Optional name for the sandbox. Named sandboxes support
+                suspend/resume. When absent the sandbox is ephemeral.
+            file_systems: File systems to mount into the sandbox
+                at boot, each at its own absolute, unique guest mount path.
+            auto_resume: Whether proxy traffic can wake a suspended sandbox.
+                None defaults to True on create. False requires a named sandbox.
+            max_pending_secs: Longest the sandbox may wait for capacity
+                before the server fails it with reason ``no_capacity``.
+                ``0`` fails at once when it cannot be placed; ``None`` (the
+                default) waits indefinitely. A bound shorter than the fleet's
+                boot time (up to 20 minutes on metal hosts) expires the very
+                demand that made the autoscaler launch a host; 30 minutes or
+                more is recommended for capacity waits.
+            wait: ``True`` (default) for the blocking create; ``False`` to
+                return a :class:`PendingSandbox` at once.
+            allow_unauthenticated_access: Allow proxy access without
+                authentication when True; require authentication when False.
+                None uses server defaults or inherits the snapshot setting.
+            exposed_ports: User ports to expose through the sandbox proxy.
+                Integers from 1 to 65535, excluding reserved port 9501;
+                duplicates are removed and ports sorted. None uses server
+                defaults or inherits the snapshot setting; [] exposes no
+                user ports.
+
+        Returns:
+            Traced[CreateSandboxResponse] with ``wait=True``;
+            :class:`PendingSandbox` with ``wait=False``.
+
+        Raises:
+            ValueError: If a file system mount pins ``snapshot_id`` without
+                ``read_only=True``
+            RemoteAPIError: If the API request fails (HTTP 409 when ``name``
+                is already held)
+            SandboxConnectionError: If the server is unreachable
+        """
+        if not wait:
+            return self._request_pending(
+                image=image,
+                cpus=cpus,
+                memory_mb=memory_mb,
+                disk_mb=disk_mb,
+                gpus=gpus,
+                gpu_model=gpu_model,
+                timeout_secs=timeout_secs,
+                entrypoint=entrypoint,
+                allow_internet_access=allow_internet_access,
+                allow_out=allow_out,
+                deny_out=deny_out,
+                snapshot_id=snapshot_id,
+                allow_unauthenticated_access=allow_unauthenticated_access,
+                exposed_ports=exposed_ports,
+                name=name,
+                file_systems=file_systems,
+                gpu=gpu,
+                max_pending_secs=max_pending_secs,
+                auto_resume=auto_resume,
+            )
+        request_model = _build_create_request(
+            image=image,
+            cpus=cpus,
+            memory_mb=memory_mb,
+            disk_mb=disk_mb,
+            gpus=gpus,
+            gpu_model=gpu_model,
+            timeout_secs=timeout_secs,
+            entrypoint=entrypoint,
+            allow_internet_access=allow_internet_access,
+            allow_out=allow_out,
+            deny_out=deny_out,
+            snapshot_id=snapshot_id,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=exposed_ports,
+            name=name,
+            file_systems=file_systems,
+            gpu=gpu,
+            max_pending_secs=max_pending_secs,
+            auto_resume=auto_resume,
+        )
+        try:
+            trace_id, response_json = self._rust_client.create_sandbox(
+                request_json=request_model.model_dump_json(
+                    by_alias=True, exclude_none=True
+                )
+            )
+            return Traced(
+                trace_id, CreateSandboxResponse.model_validate_json(response_json)
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def _create_and_wait(self, **create_args: Any) -> Traced[CreateSandboxResponse]:
+        """Blocking create for :meth:`create_and_connect`: the server answers
+        ``running``, ``failed`` or ``timeout`` (the sandbox stays queued), each
+        with the sandbox id. Its wait leaves part of this client's request
+        timeout for the answer."""
+        request_model = _build_create_request(**create_args)
+        try:
+            trace_id, response_json = self._rust_client.create_sandbox_and_wait(
+                request_json=request_model.model_dump_json(
+                    by_alias=True, exclude_none=True
+                )
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+        return Traced(
+            trace_id, CreateSandboxResponse.model_validate_json(response_json)
+        )
+
+    def _request_pending(
+        self,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        snapshot_id: str | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        proxy_url: str | None = None,
+        request_timeout: float | None = None,
+        owns_sandbox: bool = False,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> PendingSandbox:
+        """Send the create with ``wait=False`` and return the pending handle,
+        bound to this client so ``ready()`` / ``status()`` work."""
+        request_model = _build_create_request(
+            image=image,
+            cpus=cpus,
+            memory_mb=memory_mb,
+            disk_mb=disk_mb,
+            gpus=gpus,
+            gpu_model=gpu_model,
+            timeout_secs=timeout_secs,
+            entrypoint=entrypoint,
+            allow_internet_access=allow_internet_access,
+            allow_out=allow_out,
+            deny_out=deny_out,
+            snapshot_id=snapshot_id,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=exposed_ports,
+            name=name,
+            file_systems=file_systems,
+            gpu=gpu,
+            max_pending_secs=max_pending_secs,
+            auto_resume=auto_resume,
+            wait=False,
+        )
+        try:
+            trace_id, response_json = self._rust_client.create_sandbox_no_wait(
+                request_json=request_model.model_dump_json(
+                    by_alias=True, exclude_none=True
+                )
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+        pending = PendingSandbox.model_validate_json(response_json)
+        pending.trace_id = trace_id
+        return pending._bind(
+            self,
+            proxy_url=proxy_url,
+            request_timeout=request_timeout,
+            requested_name=name,
+            owns_sandbox=owns_sandbox,
+        )
+
+    def _wait_for_sandbox(
+        self,
+        sandbox_id: str,
+        timeout: float,
+        poll_interval: float,
+    ) -> Traced[SandboxInfo]:
+        """Poll ``get`` every ``poll_interval`` seconds until the sandbox
+        leaves ``pending`` or ``timeout`` elapses, returning the last
+        observation. Never raises for a timeout and never deletes."""
+        if timeout < 0:
+            raise SandboxError("timeout must be non-negative")
+        if poll_interval <= 0:
+            raise SandboxError("poll_interval must be positive")
+        try:
+            trace_id, response_json = self._rust_client.wait_for_sandbox(
+                sandbox_id=sandbox_id,
+                timeout_sec=float(timeout),
+                poll_interval_sec=float(poll_interval),
+            )
+            return Traced(trace_id, SandboxInfo.model_validate_json(response_json))
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def _settle_wait(
+        self,
+        observed: Traced[SandboxInfo],
+        *,
+        budget: float,
+        proxy_url: str | None,
+        request_timeout: float | None,
+        cancel_on_timeout: bool,
+        requested_name: str | None = None,
+        owns_sandbox: bool = False,
+        trace_id: str | None = None,
+    ) -> "Sandbox":
+        """Turn the last observed sandbox state into a handle or an error.
+        Shared by :meth:`PendingSandbox.ready` and :meth:`create_and_connect`."""
+        status = observed.status
+        sandbox_id = observed.sandbox_id
+        if status == SandboxStatus.PENDING:
+            if cancel_on_timeout:
+                try:
+                    self.delete(sandbox_id)
+                except Exception:
+                    pass
+                raise SandboxError(
+                    f"Sandbox {sandbox_id} did not start within {budget:g}s",
+                    reason=observed.pending_reason,
+                    sandbox_id=sandbox_id,
+                )
+            raise SandboxPending(
+                sandbox_id,
+                pending_reason=observed.pending_reason,
+                timeout=budget,
+            )
+        if status == SandboxStatus.RUNNING:
+            sandbox = self.connect(
+                sandbox_id,
+                proxy_url=proxy_url,
+                routing_hint=observed.routing_hint,
+                request_timeout=request_timeout,
+                _routing_info=observed.value,
+            )
+            sandbox._sandbox_id = sandbox_id
+            sandbox._owns_sandbox = owns_sandbox
+            sandbox._lifecycle_client = self
+            sandbox._trace_id = trace_id or observed.trace_id
+            sandbox._cached_info = observed.value
+            if observed.name is None and requested_name is not None:
+                sandbox._cached_info = observed.value.model_copy(
+                    update={"name": requested_name}
+                )
+            return sandbox
+        if status in (SandboxStatus.TERMINATED, SandboxStatus.FAILED):
+            raise _startup_failure(
+                sandbox_id,
+                status,
+                error_details=observed.error_details,
+                termination_reason=observed.termination_reason,
+            )
+        raise SandboxError(
+            f"Sandbox {sandbox_id} is {status.value}, not running; "
+            + (
+                "resume it to run it again"
+                if status == SandboxStatus.SUSPENDED
+                else "wait for it to settle"
+            ),
+            reason=status.value,
+            sandbox_id=sandbox_id,
+        )
+
+    def claim(
+        self,
+        pool_id: str,
+        *,
+        file_systems: list[FileSystemMount] | None = None,
+    ) -> Traced[CreateSandboxResponse]:
+        """Claim a sandbox from a pool.
+
+        Claims a warm container from the pool, or creates a new one
+        if no warm containers are available (subject to max_containers).
+
+        Args:
+            pool_id: ID of the pool to claim from
+            file_systems: File systems to mount into the claimed sandbox.
+                The sandbox becomes ready only after these mounts converge.
+
+        Returns:
+            Traced[CreateSandboxResponse] with sandbox_id, status, and trace_id
+
+        Raises:
+            ValueError: If a file system mount pins ``snapshot_id`` without
+                ``read_only=True``
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        _validate_mount_snapshot_pins(file_systems)
+        _validate_mount_owners(file_systems)
+        try:
+            claim_kwargs: dict[str, str] = {"pool_id": pool_id}
+            if file_systems:
+                request = ClaimSandboxRequest(file_systems=file_systems)
+                claim_kwargs["request_json"] = request.model_dump_json(
+                    by_alias=True, exclude_none=True
+                )
+            trace_id, response_json = self._rust_client.claim_sandbox(**claim_kwargs)
+            return Traced(
+                trace_id, CreateSandboxResponse.model_validate_json(response_json)
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def copy(
+        self,
+        sandbox_id: str,
+        *,
+        times: int = 1,
+        request_timeout: float | None = None,
+    ) -> Traced[CopySandboxResponse]:
+        """Live-copy a running sandbox.
+
+        The server creates ``times`` running copies from the source sandbox. A
+        partial response can include failed copies; inspect each returned
+        sandbox's ``status`` and ``reason``.
+
+        Args:
+            sandbox_id: Source sandbox ID or name.
+            times: Number of copies to create. Must be at least 1.
+            request_timeout: Optional HTTP request timeout in seconds for this
+                blocking copy request.
+
+        Returns:
+            Traced[CopySandboxResponse] with the source sandbox ID and copy
+            results.
+
+        Raises:
+            SandboxNotFoundError: If the source sandbox doesn't exist.
+            SandboxError: If ``times`` is invalid or the API request fails.
+        """
+        if isinstance(times, bool) or not isinstance(times, int) or times < 1:
+            raise SandboxError("times must be a positive integer")
+        client = (
+            self._with_request_timeout(request_timeout)
+            if request_timeout is not None
+            else self
+        )
+        try:
+            trace_id, response_json = client._rust_client.copy_sandbox(
+                sandbox_id=sandbox_id,
+                times=times,
+            )
+            return Traced(
+                trace_id, CopySandboxResponse.model_validate_json(response_json)
+            )
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def get(self, sandbox_id: str) -> Traced[SandboxInfo]:
+        """Get information about a sandbox.
+
+        Args:
+            sandbox_id: ID of the sandbox
+
+        Returns:
+            Traced[SandboxInfo] with full sandbox details and trace_id
+
+        Raises:
+            SandboxNotFoundError: If sandbox doesn't exist
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.get_sandbox_json(
+                sandbox_id=sandbox_id
+            )
+            return Traced(trace_id, SandboxInfo.model_validate_json(response_json))
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def list(self) -> TracedIterator[SandboxInfo]:
+        """List all sandboxes in the namespace.
+
+        Returns:
+            TracedIterator[SandboxInfo] — iterable over sandboxes, with .trace_id
+
+        Raises:
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.list_sandboxes_json()
+            data = ListSandboxesResponse.model_validate(json.loads(response_json))
+            return TracedIterator(trace_id, data.sandboxes)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def list_archived(
+        self,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+        direction: str | None = None,
+    ) -> Traced[ListArchivedSandboxesResponse]:
+        """List archived (terminated) sandboxes in the namespace.
+
+        Archived sandboxes are terminated sandboxes parked in the server's
+        archived sandboxes store until the server-configured TTL expires.
+
+        Args:
+            limit: Maximum number of archived sandboxes to return.
+            cursor: Base64-encoded pagination cursor returned by a prior call.
+            direction: Pagination direction, ``"forward"`` or ``"backward"``.
+
+        Returns:
+            Traced[ListArchivedSandboxesResponse] with paginated results.
+
+        Raises:
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.list_archived_sandboxes_json(
+                limit=limit,
+                cursor=cursor,
+                direction=direction,
+            )
+            return Traced(
+                trace_id,
+                ListArchivedSandboxesResponse.model_validate_json(response_json),
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def get_archived(self, sandbox_id: str) -> Traced[ArchivedSandboxInfo]:
+        """Get a single archived sandbox by id.
+
+        Args:
+            sandbox_id: ID of the archived sandbox.
+
+        Returns:
+            Traced[ArchivedSandboxInfo] with the archived sandbox details.
+
+        Raises:
+            SandboxNotFoundError: If no archived sandbox with the given id exists.
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.get_archived_sandbox_json(
+                sandbox_id=sandbox_id
+            )
+            return Traced(
+                trace_id, ArchivedSandboxInfo.model_validate_json(response_json)
+            )
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def update_sandbox(
+        self,
+        sandbox_id: str,
+        name: str | None = None,
+        *,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+        auto_resume: bool | None = None,
+        network: NetworkConfig | ClearNetworkPolicy | None = None,
+    ) -> Traced[SandboxInfo]:
+        """Update sandbox properties, including auto_resume while suspended.
+
+        Resource names and units match create. Which runtimes and dimensions
+        support a live resize is decided by the server, whose policy error is
+        raised unchanged. Resize requires a running sandbox and cannot be mixed
+        with name, proxy, or network changes. Omitted dimensions retain their
+        confirmed allocation.
+        Integer-valued floats such as 2048.0 are accepted for memory and disk;
+        fractional values and booleans are rejected without rounding.
+
+        If all targets already match, no update is sent. The returned resources
+        are current, but resource_resize can be None or describe an earlier
+        operation, including a failed one. Wait options are ignored when no
+        resource targets are supplied.
+
+        Args:
+            sandbox_id: ID or name of the sandbox to update.
+            name: New sandbox name. Naming an ephemeral sandbox makes it
+                non-ephemeral and enables suspend/resume.
+            cpus: Finite positive whole-vCPU target, using create's CPU units.
+            memory_mb: Positive integer memory target in MiB.
+            disk_mb: Positive integer root disk target in MiB; cannot shrink
+                below the current confirmed disk size.
+            wait: Wait for resize completion (default True). False returns
+                admission; use wait_for_resource_resize() to continue later.
+            timeout: Maximum seconds to wait for resize completion (default
+                300). Does not change sandbox lifetime or cancel the resize.
+                Zero checks once. Ignored when wait is False.
+            poll_interval: Seconds between resize polls (default 1.0); must
+                be positive. Ignored when wait is False.
+            allow_unauthenticated_access: Whether exposed user ports should be
+                reachable without Tensorlake auth.
+            auto_resume: Omit to keep the current flag. False requires a named
+                sandbox. May be changed while suspended without waking it;
+                cannot be combined with resource resizing.
+            exposed_ports: User ports routable through the sandbox proxy.
+                Port 9501 is reserved for sandbox management.
+            network: Egress network policy. Omit to leave it unchanged, pass a
+                NetworkConfig to replace it atomically, or CLEAR_NETWORK_POLICY
+                to restore unrestricted egress. Unresolvable destinations
+                reject the update and leave the previous policy enforced.
+
+        Returns:
+            Traced[SandboxInfo] with confirmed resources and the latest resize
+            metadata, which may belong to an earlier operation for a no-op.
+
+        Raises:
+            SandboxResizeError: The resize failed, timed out, was interrupted,
+                was superseded, or returned incompatible completion metadata.
+                Carries generation, reason, and confirmed_resources.
+            SandboxError: Invalid targets, wait options, or mixed update fields.
+            SandboxNotFoundError: The sandbox does not exist.
+            RemoteAPIError: The API rejected the request.
+            SandboxConnectionError: The server is unreachable.
+        """
+        resources = resize_resources(cpus, memory_mb, disk_mb)
+        if resources is not None:
+            validate_resize_wait(timeout, poll_interval)
+            if (
+                name is not None
+                or allow_unauthenticated_access is not None
+                or exposed_ports is not None
+                or auto_resume is not None
+                or network is not None
+            ):
+                raise SandboxError(
+                    "resources cannot be combined with other sandbox update fields"
+                )
+        normalized_ports = (
+            _normalize_user_ports(exposed_ports) if exposed_ports is not None else None
+        )
+        clearing_network = network is CLEAR_NETWORK_POLICY
+        network_config = network if isinstance(network, NetworkConfig) else None
+        if (
+            name is None
+            and allow_unauthenticated_access is None
+            and normalized_ports is None
+            and auto_resume is None
+            and network_config is None
+            and not clearing_network
+            and resources is None
+        ):
+            raise SandboxError("At least one sandbox update field must be provided.")
+
+        request = UpdateSandboxRequest(
+            resources=resources,
+            name=name,
+            allow_unauthenticated_access=allow_unauthenticated_access,
+            exposed_ports=normalized_ports,
+            auto_resume=auto_resume,
+            network=network_config,
+        )
+        # exclude_none omits an unset policy (keep); CLEAR must reach the wire
+        # as an explicit null so the service clears it. Mirrors the pool
+        # tri-state contract in _pool_update_request_json.
+        payload = json.loads(request.model_dump_json(exclude_none=True))
+        if clearing_network:
+            payload["network"] = None
+        wait_options = (
+            dict(wait=wait, timeout_sec=timeout, poll_interval_sec=poll_interval)
+            if resources is not None
+            else {}
+        )
+        try:
+            trace_id, response_json = self._rust_client.update_sandbox(
+                sandbox_id=sandbox_id,
+                request_json=json.dumps(payload),
+                **wait_options,
+            )
+            return Traced(trace_id, SandboxInfo.model_validate_json(response_json))
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def wait_for_resource_resize(
+        self,
+        sandbox_id: str,
+        generation: int,
+        *,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+    ) -> Traced[SandboxInfo]:
+        """Wait for an exact resize generation without submitting another update.
+
+        Args:
+            sandbox_id: ID or name of the sandbox to observe.
+            generation: Positive generation returned by the update or timeout error.
+            timeout: Maximum wait in seconds (default 300). Timeout never
+                cancels the resize; call this method again to keep waiting.
+                Zero checks once.
+            poll_interval: Positive seconds between polls (default 1.0).
+
+        Returns:
+            Traced[SandboxInfo] with the completed generation's confirmed resources.
+
+        Raises:
+            SandboxResizeError: Failure, timeout, interruption, superseding, or
+                incompatible metadata; includes the last confirmed_resources.
+            SandboxError: Invalid generation or wait options.
+            SandboxNotFoundError: The sandbox does not exist.
+            RemoteAPIError: The API rejected the request.
+            SandboxConnectionError: The server is unreachable.
+        """
+        validate_resize_wait(timeout, poll_interval, generation)
+        try:
+            trace_id, response_json = self._rust_client.wait_for_resource_resize(
+                sandbox_id=sandbox_id,
+                generation=generation,
+                timeout_sec=timeout,
+                poll_interval_sec=poll_interval,
+            )
+            return Traced(trace_id, SandboxInfo.model_validate_json(response_json))
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def get_port_access(self, sandbox_id: str) -> Traced[SandboxPortAccess]:
+        """Return the current sandbox proxy settings for user ports."""
+        traced = self.get(sandbox_id)
+        port_access = SandboxPortAccess(
+            allow_unauthenticated_access=traced.allow_unauthenticated_access,
+            exposed_ports=sorted(set(traced.exposed_ports or [])),
+            ingress_endpoint=traced.ingress_endpoint,
+            sandbox_url=traced.sandbox_url,
+        )
+        return Traced(traced.trace_id, port_access)
+
+    def expose_ports(
+        self,
+        sandbox_id: str,
+        ports: list[int],
+        *,
+        allow_unauthenticated_access: bool | None = None,
+    ) -> Traced[SandboxInfo]:
+        """Expose additional user ports through the sandbox proxy.
+
+        By default this preserves the sandbox's current auth mode for user ports.
+        Set ``allow_unauthenticated_access=True`` to make them publicly reachable.
+        """
+        current = self.get_port_access(sandbox_id)
+        desired_ports = sorted(
+            set(current.exposed_ports + _normalize_user_ports(ports))
+        )
+        return self.update_sandbox(
+            sandbox_id,
+            allow_unauthenticated_access=(
+                current.allow_unauthenticated_access
+                if allow_unauthenticated_access is None
+                else allow_unauthenticated_access
+            ),
+            exposed_ports=desired_ports,
+        )
+
+    def unexpose_ports(self, sandbox_id: str, ports: list[int]) -> Traced[SandboxInfo]:
+        """Remove one or more user ports from the sandbox proxy allowlist."""
+        current = self.get_port_access(sandbox_id)
+        ports_to_remove = set(_normalize_user_ports(ports))
+        desired_ports = [
+            port for port in current.exposed_ports if port not in ports_to_remove
+        ]
+        return self.update_sandbox(
+            sandbox_id,
+            allow_unauthenticated_access=(
+                current.allow_unauthenticated_access if desired_ports else False
+            ),
+            exposed_ports=desired_ports,
+        )
+
+    def delete(self, sandbox_id: str) -> Traced[None]:
+        """Terminate a sandbox.
+
+        Args:
+            sandbox_id: ID of the sandbox to terminate
+
+        Raises:
+            SandboxNotFoundError: If sandbox doesn't exist
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id = self._rust_client.delete_sandbox(sandbox_id=sandbox_id)
+            return Traced(trace_id, None)
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def get_logs(
+        self,
+        sandbox_id: str,
+        *,
+        levels: list[SandboxLogLevel | str] | None = None,
+        process_ids: list[str] | None = None,
+        next_token: str | None = None,
+        head: int | None = None,
+        tail: int | None = None,
+        body: str | None = None,
+    ) -> Traced[SandboxLogsResponse]:
+        """Read persisted logs for a sandbox."""
+        payload = {
+            "sandbox_id": sandbox_id,
+            "levels": _normalize_log_levels(levels),
+            "process_ids": process_ids or [],
+            "next_token": next_token,
+            "head": head,
+            "tail": tail,
+            "body": body,
+        }
+        try:
+            trace_id, response_json = self._rust_client.get_sandbox_logs_json(
+                json.dumps(payload)
+            )
+            return Traced(
+                trace_id, SandboxLogsResponse.model_validate_json(response_json)
+            )
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def list_log_processes(
+        self, sandbox_id: str
+    ) -> Traced[SandboxProcessLogFiltersResponse]:
+        """List sandbox processes available as persisted-log filters."""
+        try:
+            trace_id, response_json = self._rust_client.list_sandbox_log_processes_json(
+                sandbox_id
+            )
+            return Traced(
+                trace_id,
+                SandboxProcessLogFiltersResponse.model_validate_json(response_json),
+            )
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def suspend(
+        self,
+        sandbox_id: str,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+    ) -> Traced[None]:
+        """Suspend a named sandbox.
+
+        Only sandboxes created with a ``name`` can be suspended; ephemeral
+        sandboxes cannot. By default blocks until the sandbox is fully
+        ``Suspended``; pass ``wait=False`` for fire-and-return.
+
+        The server answers as soon as the suspend completes. When its wait
+        runs out first, or the server does not support waiting, the rest of
+        ``timeout`` is spent polling every ``poll_interval`` seconds.
+
+        Args:
+            sandbox_id: ID or name of the sandbox to suspend
+            wait: If True (default), wait until Suspended; False returns immediately.
+            timeout: Max seconds to wait when wait=True (default 300)
+            poll_interval: Seconds between polls once the server's own wait
+                has run out (default 1.0)
+
+        Raises:
+            SandboxNotFoundError: If sandbox doesn't exist
+            SandboxError: If wait=True and sandbox doesn't suspend within timeout
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        return self._change_lifecycle(
+            sandbox_id,
+            "suspend",
+            SandboxStatus.SUSPENDED,
+            lambda: self._rust_client.suspend_sandbox(sandbox_id=sandbox_id),
+            lambda wait_sec: self._rust_client.suspend_sandbox_and_wait(
+                sandbox_id=sandbox_id, wait_sec=wait_sec
+            ),
+            wait,
+            timeout,
+            poll_interval,
+        )
+
+    def resume(
+        self,
+        sandbox_id: str,
+        wait: bool = True,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+    ) -> Traced[None]:
+        """Resume a suspended sandbox.
+
+        By default blocks until the sandbox is ``Running``; pass
+        ``wait=False`` for fire-and-return.
+
+        The server answers as soon as the sandbox runs. When its wait runs
+        out first, or the server does not support waiting, the rest of
+        ``timeout`` is spent polling every ``poll_interval`` seconds.
+
+        Args:
+            sandbox_id: ID or name of the sandbox to resume
+            wait: If True (default), wait until Running; False returns immediately.
+            timeout: Max seconds to wait when wait=True (default 300)
+            poll_interval: Seconds between polls once the server's own wait
+                has run out (default 1.0)
+
+        Raises:
+            SandboxNotFoundError: If sandbox doesn't exist
+            SandboxError: If wait=True and sandbox doesn't resume within timeout
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        return self._change_lifecycle(
+            sandbox_id,
+            "resume",
+            SandboxStatus.RUNNING,
+            lambda: self._rust_client.resume_sandbox(sandbox_id=sandbox_id),
+            lambda wait_sec: self._rust_client.resume_sandbox_and_wait(
+                sandbox_id=sandbox_id, wait_sec=wait_sec
+            ),
+            wait,
+            timeout,
+            poll_interval,
+        )
+
+    def _change_lifecycle(
+        self,
+        sandbox_id: str,
+        action: str,
+        target: SandboxStatus,
+        send: Callable[[], str],
+        send_and_wait: Callable[[float], tuple[str, bool]],
+        wait: bool,
+        timeout: float,
+        poll_interval: float,
+    ) -> Traced[None]:
+        """Send a suspend or resume. With ``wait``, the server waits for
+        ``target`` and answers whether it was reached; when its wait runs out
+        first, the rest of ``timeout`` is spent polling."""
+        deadline = time.time() + timeout
+        try:
+            if not wait:
+                return Traced(send(), None)
+            trace_id, settled = send_and_wait(timeout)
+        except Exception as e:
+            status_code = _rust_status_code(e)
+            if status_code == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            if status_code != 409:
+                _raise_as_sandbox_error(e)
+            # The request failed or another one superseded it. A concurrent
+            # request may still have reached the target.
+            info = self.get(sandbox_id)
+            if info.value.status == target:
+                return Traced(info.trace_id, None)
+            _raise_as_sandbox_error(e)
+        if settled:
+            return Traced(trace_id, None)
+        while time.time() < deadline:
+            info = self.get(sandbox_id).value
+            if info.status == target:
+                return Traced(trace_id, None)
+            if info.status == SandboxStatus.TERMINATED:
+                raise SandboxError(
+                    f"Sandbox {sandbox_id!r} terminated while waiting for {action}"
+                )
+            time.sleep(poll_interval)
+        raise SandboxError(f"Sandbox {sandbox_id!r} did not {action} within {timeout}s")
+
+    # --- File system operations ---
+
+    def attach_file_system(
+        self,
+        sandbox_id: str,
+        file_system_id: str,
+        mount_path: str,
+        *,
+        read_only: bool = False,
+        prefetch: bool = False,
+        snapshot_id: str | None = None,
+        owner: str | None = None,
+    ) -> Traced[SandboxInfo]:
+        """Attach a registered file system to a running sandbox.
+
+        The mount completes asynchronously on the dataplane; the returned
+        ``SandboxInfo`` already reflects the new entry in
+        ``file_systems``.
+
+        Args:
+            sandbox_id: ID or name of the running sandbox.
+            file_system_id: The registered file system's name (created with
+                ``tl fs create <name>``).
+            mount_path: Absolute, unique guest mount path (e.g. ``/mnt/skills``).
+            read_only: Mount the file system read-only.
+            prefetch: Eagerly download the file system's contents.
+            snapshot_id: Pin the mount to a specific filesystem snapshot.
+                Requires ``read_only=True``.
+            owner: Present the mounted files as owned by this guest user:
+                ``NAME``, ``UID``, ``NAME:GROUP``, or ``UID:GID`` (e.g.
+                ``"agent"`` or ``"1001:1001"``), resolved against the sandbox
+                image's own user database when the mount attaches. Unset keeps
+                the image default (the baked ``tl-user`` account when the
+                image has one, otherwise root).
+
+        Returns:
+            Traced[SandboxInfo] with the sandbox's updated file systems.
+
+        Raises:
+            ValueError: If ``snapshot_id`` is set without ``read_only=True``
+            SandboxNotFoundError: If the sandbox doesn't exist
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        _attach_mounts = [
+            FileSystemMount(
+                file_system_id=file_system_id,
+                mount_path=mount_path,
+                read_only=read_only,
+                prefetch=prefetch,
+                snapshot_id=snapshot_id,
+                owner=owner,
+            )
+        ]
+        _validate_mount_snapshot_pins(_attach_mounts)
+        _validate_mount_owners(_attach_mounts)
+        try:
+            trace_id, response_json = self._rust_client.attach_file_system(
+                sandbox_id=sandbox_id,
+                file_system_id=file_system_id,
+                mount_path=mount_path,
+                read_only=read_only,
+                prefetch=prefetch,
+                snapshot_id=snapshot_id,
+                owner=owner,
+            )
+            return Traced(trace_id, SandboxInfo.model_validate_json(response_json))
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def detach_file_system(
+        self,
+        sandbox_id: str,
+        mount_path: str,
+    ) -> Traced[SandboxInfo]:
+        """Detach the file system mounted at ``mount_path`` from a sandbox.
+
+        The unmount completes asynchronously on the dataplane; the returned
+        ``SandboxInfo`` already reflects the removed ``file_systems``
+        entry.
+
+        Args:
+            sandbox_id: ID or name of the running sandbox.
+            mount_path: Absolute guest mount path of the file system to
+                unmount.
+
+        Returns:
+            Traced[SandboxInfo] with the sandbox's updated file systems.
+
+        Raises:
+            SandboxNotFoundError: If the sandbox doesn't exist
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.detach_file_system(
+                sandbox_id=sandbox_id,
+                mount_path=mount_path,
+            )
+            return Traced(trace_id, SandboxInfo.model_validate_json(response_json))
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    # --- Snapshot operations ---
+
+    def snapshot(
+        self,
+        sandbox_id: str,
+        snapshot_type: SnapshotType | None = None,
+    ) -> Traced[CreateSnapshotResponse]:
+        """Create a snapshot of a running sandbox's filesystem.
+
+        This is an asynchronous operation. Poll with :meth:`get_snapshot`
+        until the status is ``local_ready``, ``completed``, or ``failed``.
+
+        Args:
+            sandbox_id: ID of the running sandbox to snapshot.
+            snapshot_type: Optional snapshot type. When ``None`` (default)
+                the server picks its default. Use
+                :attr:`SnapshotType.FILESYSTEM` for snapshots that should be
+                cold-booted by sandboxes restoring from them (e.g. sandbox
+                image builds).
+
+        Returns:
+            Traced[CreateSnapshotResponse] with snapshot_id, status, and trace_id
+
+        Raises:
+            SandboxNotFoundError: If sandbox doesn't exist
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.create_snapshot(
+                sandbox_id=sandbox_id,
+                snapshot_type=(
+                    snapshot_type.value if snapshot_type is not None else None
+                ),
+            )
+            return Traced(trace_id, CreateSnapshotResponse.from_response(response_json))
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise SandboxNotFoundError(sandbox_id) from None
+            _raise_as_sandbox_error(e)
+
+    def get_snapshot(self, snapshot_id: str) -> Traced[SnapshotInfo]:
+        """Get information about a snapshot.
+
+        Args:
+            snapshot_id: ID of the snapshot
+
+        Returns:
+            Traced[SnapshotInfo] with full snapshot details and trace_id
+
+        Raises:
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.get_snapshot_json(
+                snapshot_id=snapshot_id
+            )
+            return Traced(trace_id, SnapshotInfo.from_response(response_json))
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def list_snapshots(self) -> TracedIterator[SnapshotInfo]:
+        """List all snapshots in the namespace.
+
+        Returns:
+            TracedIterator[SnapshotInfo] — iterable over snapshots, with .trace_id
+
+        Raises:
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.list_snapshots_json()
+            data = ListSnapshotsResponse.from_response(response_json)
+            return TracedIterator(trace_id, data.snapshots)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def list_sandbox_snapshots(self, sandbox_id: str) -> TracedIterator[SnapshotInfo]:
+        """List snapshots taken from one sandbox.
+
+        Reads the sandbox's own snapshot listing, so its cost does not grow with
+        the rest of the namespace.
+
+        Args:
+            sandbox_id: The sandbox's ID or name.
+
+        Returns:
+            TracedIterator[SnapshotInfo] — iterable over the sandbox's snapshots, with .trace_id
+
+        Raises:
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.list_sandbox_snapshots_json(
+                sandbox_id
+            )
+            data = ListSnapshotsResponse.from_response(response_json)
+            return TracedIterator(trace_id, data.snapshots)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def delete_snapshot(self, snapshot_id: str) -> Traced[None]:
+        """Delete a snapshot.
+
+        Args:
+            snapshot_id: ID of the snapshot to delete
+
+        Raises:
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id = self._rust_client.delete_snapshot(snapshot_id=snapshot_id)
+            return Traced(trace_id, None)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def snapshot_and_wait(
+        self,
+        sandbox_id: str,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+        snapshot_type: SnapshotType | None = None,
+        wait_until: SnapshotWaitCondition | str = SnapshotWaitCondition.LOCAL_READY,
+    ) -> Traced[SnapshotInfo]:
+        """Create a snapshot and wait until it is resumable.
+
+        Args:
+            sandbox_id: ID of the running sandbox to snapshot
+            timeout: Max seconds to wait (default 300)
+            poll_interval: Seconds between status polls (default 1)
+            snapshot_type: Optional snapshot type. See :meth:`snapshot` for
+                details.
+            wait_until: Snapshot readiness condition. Defaults to
+                :attr:`SnapshotWaitCondition.LOCAL_READY`, which is enough to
+                resume from the snapshot. Use
+                :attr:`SnapshotWaitCondition.COMPLETED` when durable
+                ``snapshot_uri`` metadata is required.
+
+        Returns:
+            Traced[SnapshotInfo] with snapshot details and trace_id
+
+        Raises:
+            SandboxError: If snapshot fails or times out
+        """
+        try:
+            wait_condition = SnapshotWaitCondition(wait_until)
+        except ValueError as e:
+            raise SandboxError("wait_until must be 'local_ready' or 'completed'") from e
+
+        traced_create = self.snapshot(sandbox_id, snapshot_type=snapshot_type)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            traced_info = self.get_snapshot(traced_create.snapshot_id)
+            if snapshot_satisfies_wait_condition(traced_info.status, wait_condition):
+                return traced_info
+            if traced_info.status == SnapshotStatus.FAILED:
+                raise SandboxError(
+                    f"Snapshot {traced_create.snapshot_id} failed: {traced_info.error}"
+                )
+            if traced_info.status == SnapshotStatus.DELETING:
+                raise SandboxError(
+                    f"Snapshot {traced_create.snapshot_id} is being deleted"
+                )
+            time.sleep(poll_interval)
+        raise SandboxError(
+            f"Snapshot {traced_create.snapshot_id} did not reach {wait_condition.value} within {timeout}s"
+        )
+
+    # --- Pool operations ---
+
+    def create_pool(
+        self,
+        image: str | None = None,
+        cpus: float = 1.0,
+        memory_mb: int = 1024,
+        disk_mb: int | None = None,
+        timeout_secs: int = 0,
+        entrypoint: list[str] | None = None,
+        max_containers: int | None = None,
+        warm_containers: int | None = None,
+        network: NetworkConfig | ClearNetworkPolicy | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        gpu: GpuRequest | None = None,
+    ) -> Traced[CreateSandboxPoolResponse]:
+        """Create a new sandbox pool.
+
+        Args:
+            image: Sandbox image name to boot from, such as
+                ``tensorlake/ubuntu-minimal`` or a registered Sandbox Image name.
+            cpus: Number of CPUs to allocate
+            memory_mb: Memory in MiB
+            disk_mb: Root disk size in MiB. When omitted, the registered
+                image's root disk size is used.
+            timeout_secs: Timeout in seconds (default: 0 = no timeout)
+            entrypoint: Custom entrypoint command (optional)
+            max_containers: Maximum number of containers in pool
+            warm_containers: Number of warm containers to maintain
+            network: Network policy for each container in the pool
+            gpus: GPUs per container, using A10 unless ``gpu_model`` is set.
+                GPU CAS pools require a CAS image.
+            gpu_model: GPU model to allocate for each container. Defaults to
+                one GPU when ``gpus`` is omitted.
+            gpu: Typed GPU allocation, exclusive with ``gpus``/``gpu_model``.
+
+        Returns:
+            CreateSandboxPoolResponse with pool_id and namespace
+
+        Raises:
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        if network is CLEAR_NETWORK_POLICY:
+            raise ValueError(
+                "CLEAR_NETWORK_POLICY only applies to update_pool; omit network "
+                "to create a pool without a policy."
+            )
+
+        request_model = SandboxPoolRequest(
+            image=image,
+            resources=CreateSandboxResources(
+                cpus=cpus,
+                memory_mb=memory_mb,
+                disk_mb=disk_mb,
+                gpus=_build_gpu_resources(gpus, gpu_model, gpu),
+            ),
+            timeout_secs=timeout_secs,
+            entrypoint=entrypoint,
+            max_containers=max_containers,
+            warm_containers=warm_containers,
+            network=network,
+        )
+
+        try:
+            trace_id, response_json = self._rust_client.create_pool(
+                request_json=request_model.model_dump_json(exclude_none=True)
+            )
+            return Traced(
+                trace_id, CreateSandboxPoolResponse.model_validate_json(response_json)
+            )
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def get_pool(self, pool_id: str) -> Traced[SandboxPoolInfo]:
+        """Get information about a sandbox pool.
+
+        Args:
+            pool_id: ID of the pool
+
+        Returns:
+            Traced[SandboxPoolInfo] with full pool details and trace_id
+
+        Raises:
+            PoolNotFoundError: If pool doesn't exist
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.get_pool_json(pool_id=pool_id)
+            return Traced(trace_id, SandboxPoolInfo.model_validate_json(response_json))
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise PoolNotFoundError(pool_id) from None
+            _raise_as_sandbox_error(e)
+
+    def list_pools(self) -> TracedIterator[SandboxPoolInfo]:
+        """List all sandbox pools in the namespace.
+
+        Returns:
+            TracedIterator[SandboxPoolInfo] — iterable over pools, with .trace_id
+
+        Raises:
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id, response_json = self._rust_client.list_pools_json()
+            data = ListSandboxPoolsResponse.model_validate(json.loads(response_json))
+            return TracedIterator(trace_id, data.pools)
+        except Exception as e:
+            _raise_as_sandbox_error(e)
+
+    def update_pool(
+        self,
+        pool_id: str,
+        image: str,
+        cpus: float = 1.0,
+        memory_mb: int = 1024,
+        disk_mb: int | None = None,
+        timeout_secs: int = 0,
+        entrypoint: list[str] | None = None,
+        max_containers: int | None = None,
+        warm_containers: int | None = None,
+        network: NetworkConfig | ClearNetworkPolicy | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        gpu: GpuRequest | None = None,
+    ) -> Traced[SandboxPoolInfo]:
+        """Update a sandbox pool configuration.
+
+        Omit ``network`` to keep the pool's current network policy, set it to
+        replace the policy, or pass :data:`CLEAR_NETWORK_POLICY` to remove the
+        policy entirely. On a change the service recycles the pool's unclaimed
+        warm containers onto the new policy, while containers already claimed
+        by sandboxes keep the policy they booted with. Changes to CPU, memory,
+        disk, GPU allocation, image, or entrypoint likewise recycle unclaimed
+        warm containers asynchronously. If suitable capacity is unavailable,
+        the pool remains below its warm target until capacity appears; stale
+        warm containers are never used as a fallback.
+
+        Args:
+            pool_id: ID of the pool to update
+            image: Sandbox image name to boot from, such as
+                ``tensorlake/ubuntu-minimal`` or a registered Sandbox Image name.
+            cpus: Number of CPUs to allocate
+            memory_mb: Memory in MiB
+            disk_mb: Root disk size in MiB. When omitted, the registered
+                image's root disk size is used.
+            timeout_secs: Timeout in seconds (default: 0 = no timeout)
+            entrypoint: Custom entrypoint command (optional)
+            max_containers: Maximum number of containers in pool
+            warm_containers: Number of warm containers to maintain
+            network: Replacement network policy for each container in the
+                pool. Omit to keep the current policy, or pass
+                ``CLEAR_NETWORK_POLICY`` to remove it.
+            gpus: GPUs per container, using A10 unless ``gpu_model`` is set.
+                Include the GPU allocation on each update to keep a GPU CAS
+                pool; omitting it configures a CPU-only CAS pool.
+            gpu_model: GPU model to allocate for each container. Defaults to
+                one GPU when ``gpus`` is omitted.
+            gpu: Typed GPU allocation, exclusive with ``gpus``/``gpu_model``.
+
+        Returns:
+            SandboxPoolInfo with updated pool details
+
+        Raises:
+            PoolNotFoundError: If pool doesn't exist
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        request_model = SandboxPoolRequest(
+            image=image,
+            resources=CreateSandboxResources(
+                cpus=cpus,
+                memory_mb=memory_mb,
+                disk_mb=disk_mb,
+                gpus=_build_gpu_resources(gpus, gpu_model, gpu),
+            ),
+            timeout_secs=timeout_secs,
+            entrypoint=entrypoint,
+            max_containers=max_containers,
+            warm_containers=warm_containers,
+            network=None if network is CLEAR_NETWORK_POLICY else network,
+        )
+
+        try:
+            trace_id, response_json = self._rust_client.update_pool(
+                pool_id=pool_id,
+                request_json=_pool_update_request_json(request_model, network),
+            )
+            return Traced(trace_id, SandboxPoolInfo.model_validate_json(response_json))
+        except Exception as e:
+            if _rust_status_code(e) == 404:
+                raise PoolNotFoundError(pool_id) from None
+            _raise_as_sandbox_error(e)
+
+    def delete_pool(self, pool_id: str) -> Traced[None]:
+        """Delete a sandbox pool.
+
+        Args:
+            pool_id: ID of the pool to delete
+
+        Raises:
+            PoolNotFoundError: If pool doesn't exist
+            PoolInUseError: If pool has active containers
+            RemoteAPIError: If the API request fails
+            SandboxConnectionError: If the server is unreachable
+        """
+        try:
+            trace_id = self._rust_client.delete_pool(pool_id=pool_id)
+            return Traced(trace_id, None)
+        except Exception as e:
+            kind, status_code, message = _parse_rust_client_error_fields(e)
+            if status_code == 404:
+                raise PoolNotFoundError(pool_id) from None
+            if status_code == 409:
+                raise PoolInUseError(pool_id, message) from None
+            if kind == "connection":
+                raise SandboxConnectionError(message) from None
+            _raise_as_sandbox_error(e)
+
+    def connect(
+        self,
+        identifier: str | None = None,
+        *,
+        proxy_url: str | None = None,
+        sandbox_id: str | None = None,
+        routing_hint: str | None = None,
+        request_timeout: float | None = None,
+        _routing_info: object | None = None,
+    ) -> "Sandbox":
+        """Connect to a running sandbox for process and file operations.
+
+        Args:
+            identifier: Sandbox ID or name to connect to.
+            proxy_url: Explicit sandbox proxy URL override. When omitted,
+                the client resolves the sandbox and uses the server-returned
+                ``sandbox_url``. Can also be set via the
+                ``TENSORLAKE_SANDBOX_PROXY_URL`` environment variable.
+            sandbox_id: Deprecated alias for ``identifier``.
+
+        Returns:
+            Sandbox instance for interacting with the running sandbox
+        """
+        from .sandbox import Sandbox
+
+        sandbox_identifier = _resolve_sandbox_identifier(
+            identifier,
+            sandbox_id,
+            parameter_name="identifier",
+        )
+
+        info: Traced[SandboxInfo] | None = None
+        routing_info = _routing_info
+        cached_info: SandboxInfo | None = None
+        proxy_sandbox_id = sandbox_identifier
+        explicit_proxy_url = (
+            proxy_url if proxy_url is not None else _explicit_proxy_url_override()
+        )
+        selected_proxy_url = explicit_proxy_url
+        if routing_info is None and proxy_url is None:
+            info = self.get(sandbox_identifier)
+            routing_info = info.value
+            cached_info = info.value
+            if info.status == SandboxStatus.PENDING:
+                # The sandbox is queued for capacity. Wait for it here rather
+                # than failing: readiness is a property of the sandbox, not
+                # of the create call that requested it.
+                budget = (
+                    request_timeout
+                    if request_timeout is not None
+                    else self._request_timeout
+                )
+                observed = self._wait_for_sandbox(
+                    info.sandbox_id, budget, DEFAULT_WAIT_POLL_INTERVAL_SEC
+                )
+                if observed.status == SandboxStatus.PENDING:
+                    raise SandboxPending(
+                        observed.sandbox_id,
+                        pending_reason=observed.pending_reason,
+                        timeout=budget,
+                    )
+                if observed.status in (SandboxStatus.TERMINATED, SandboxStatus.FAILED):
+                    raise _startup_failure(
+                        observed.sandbox_id,
+                        observed.status,
+                        error_details=observed.error_details,
+                        termination_reason=observed.termination_reason,
+                    )
+                routing_info = observed.value
+                cached_info = observed.value
+        if routing_info is not None:
+            proxy_sandbox_id = routing_info.sandbox_id
+            routing_hint = routing_hint or routing_info.routing_hint
+            if isinstance(routing_info, SandboxInfo):
+                cached_info = routing_info
+            if not routing_info.sandbox_url and not explicit_proxy_url:
+                # A sandbox that is not Running yet has no sandbox_url, so
+                # a proxy-backed handle cannot be built for it.
+                raise SandboxNotRoutableError(
+                    proxy_sandbox_id,
+                    getattr(routing_info, "status", None),
+                )
+            selected_proxy_url = self._rust_client.select_sandbox_proxy_url(
+                sandbox_id=proxy_sandbox_id,
+                sandbox_url=routing_info.sandbox_url,
+                ingress_endpoint=routing_info.ingress_endpoint,
+                explicit_proxy_url=explicit_proxy_url,
+            )
+        if selected_proxy_url is None:
+            raise SandboxError(
+                "server response did not include sandbox_url; refusing to derive a proxy URL"
+            )
+
+        connect_proxy_kwargs = {
+            "proxy_url": selected_proxy_url,
+            "sandbox_id": proxy_sandbox_id,
+            "routing_hint": routing_hint,
+        }
+        if request_timeout is not None:
+            connect_proxy_kwargs["request_timeout_sec"] = request_timeout
+        proxy_rust_client = self._rust_client.connect_proxy(**connect_proxy_kwargs)
+
+        sandbox = Sandbox(
+            identifier=proxy_sandbox_id,
+            proxy_url=selected_proxy_url,
+            api_key=self._api_key,
+            organization_id=self._organization_id,
+            project_id=self._project_id,
+            routing_hint=routing_hint,
+            request_timeout=request_timeout,
+            _proxy_rust_client=proxy_rust_client,
+            _explicit_proxy_url=explicit_proxy_url,
+        )
+        sandbox._lifecycle_client = self
+        if info is not None:
+            sandbox._sandbox_id = info.sandbox_id
+            sandbox._trace_id = info.trace_id
+        if cached_info is not None:
+            sandbox._sandbox_id = cached_info.sandbox_id
+            sandbox._cached_info = cached_info
+        return sandbox
+
+    def create_and_connect(
+        self,
+        image: str | None = None,
+        cpus: float | None = None,
+        memory_mb: int | None = None,
+        disk_mb: int | None = None,
+        gpus: int | None = None,
+        gpu_model: GpuModel | str | None = None,
+        timeout_secs: int | None = None,
+        entrypoint: list[str] | None = None,
+        allow_internet_access: bool = True,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        pool_id: str | None = None,
+        snapshot_id: str | None = None,
+        proxy_url: str | None = None,
+        request_timeout: float | None = None,
+        startup_timeout: float | None = None,
+        name: str | None = None,
+        file_systems: list[FileSystemMount] | None = None,
+        gpu: GpuRequest | None = None,
+        max_pending_secs: int | None = None,
+        cancel_on_timeout: bool = False,
+        poll_interval: float = DEFAULT_WAIT_POLL_INTERVAL_SEC,
+        auto_resume: bool | None = None,
+        *,
+        allow_unauthenticated_access: bool | None = None,
+        exposed_ports: list[int] | None = None,
+    ) -> "Sandbox":
+        """Create a sandbox, wait for it to start, and return a connected Sandbox.
+
+        The create waits on the server, which answers as soon as the sandbox
+        runs, with ``request_timeout`` as the wait budget. The returned
+        Sandbox auto-terminates when used as a context manager.
+
+        **When the wait runs out the sandbox is not deleted.** A
+        ``SandboxPending`` is raised with the sandbox id, and the sandbox
+        keeps its place in the queue and starts whenever capacity arrives;
+        :meth:`connect` with that id to collect it, or :meth:`delete` it to
+        give up. Pass ``cancel_on_timeout=True`` for the
+        previous behaviour (delete, then raise ``SandboxError``), or set
+        ``max_pending_secs`` to let the server fail it after a bound.
+
+        Args:
+            image: Sandbox image name to boot from, such as
+                ``tensorlake/ubuntu-minimal`` or a registered Sandbox Image name
+                (optional if using pool).
+            cpus: Number of CPUs to allocate. Defaults to 1 for fresh
+                creates; omitted snapshot restores inherit this value.
+            memory_mb: Memory in MiB. Defaults to 1024 for fresh
+                creates; omitted snapshot restores inherit this value.
+            disk_mb: Root disk size in MiB. When omitted, the server
+                uses its default disk size.
+            gpus: Number of GPUs to allocate. When provided, defaults to
+                ``A10`` unless ``gpu_model`` is set. GPU CAS sandboxes require a
+                CAS image; when ``image`` is omitted, the server selects its
+                configured GPU default.
+            gpu_model: GPU model to allocate. Accepts any :class:`GpuModel` value.
+                Defaults to one GPU when ``gpus`` is omitted.
+            gpu: Typed GPU model and count request. Cannot be combined with
+                ``gpus`` or ``gpu_model``.
+            timeout_secs: Timeout in seconds (optional)
+            entrypoint: Custom entrypoint command (optional)
+            allow_internet_access: A simple switch while *allow_out* is
+                empty: True (the default) allows all outbound traffic
+                except *deny_out* matches; False blocks all egress,
+                including DNS. A non-empty *allow_out* is default-deny in
+                both modes; the flag then only controls whether the
+                sandbox's DNS resolver is implicitly allowed (True) or
+                must itself be listed in *allow_out* (False).
+            allow_out: Destinations to allow: IPs, CIDRs, or hostnames
+                (e.g. ``["8.8.8.8", "10.0.0.0/8", "api.example.com"]``).
+                When non-empty, all unlisted destinations are blocked.
+                Overridden by any matching *deny_out* entry.
+            deny_out: Destinations to deny: IPs, CIDRs, or hostnames
+                (e.g. ``["192.168.1.0/24"]``). Takes precedence over
+                *allow_out*.
+            pool_id: Pool ID to use for warm containers (optional). A pool
+                claim answers from the server-side wait; a claim that is
+                still starting is then waited on the same way.
+            snapshot_id: ID of a completed snapshot to restore from
+            proxy_url: Explicit sandbox proxy URL override. When omitted,
+                the connected sandbox uses the server-returned ``sandbox_url``.
+            request_timeout: Max seconds to wait for Running status.
+                Defaults to the client request timeout.
+            startup_timeout: Deprecated alias for ``request_timeout``.
+            name: Optional name for the sandbox. Named sandboxes support
+                suspend/resume. When absent the sandbox is ephemeral.
+            file_systems: File systems to mount into the sandbox
+                at boot or warm-pool claim, each at its own absolute, unique
+                guest mount path.
+            auto_resume: Whether proxy traffic can wake a suspended sandbox.
+                None defaults to True on create. False requires a named sandbox.
+            max_pending_secs: Server-side bound on the capacity wait; see
+                :meth:`create`. Unset waits indefinitely.
+            cancel_on_timeout: Delete the sandbox when ``request_timeout``
+                runs out while it is still pending, then raise
+                ``SandboxError``. Default False: raise ``SandboxPending`` and
+                leave the sandbox queued.
+            poll_interval: Seconds between readiness polls once the
+                server's own wait has run out (default 2).
+            allow_unauthenticated_access: Proxy authentication setting; see
+                :meth:`create`. Cannot be combined with ``pool_id`` because
+                pool claims inherit access settings from the pool.
+            exposed_ports: User ports to expose; see :meth:`create`.
+                Cannot be combined with ``pool_id``, including an empty list.
+
+        Returns:
+            Connected Sandbox instance (auto-terminates in context manager)
+
+        Raises:
+            SandboxPending: The wait ran out while the sandbox was still
+                pending (and ``cancel_on_timeout`` is False).
+            SandboxError: If the sandbox fails to start; ``reason`` carries
+                the server's reason, such as ``no_capacity``. Also raised
+                when access overrides are combined with ``pool_id``.
+            SandboxConnectionError: If the server is unreachable
+        """
+        if pool_id is not None and (
+            allow_unauthenticated_access is not None or exposed_ports is not None
+        ):
+            raise SandboxError(
+                "allow_unauthenticated_access and exposed_ports cannot be combined "
+                "with pool_id: pool claims inherit access settings from the pool."
+            )
+        wait_timeout = (
+            request_timeout
+            if request_timeout is not None
+            else (
+                startup_timeout
+                if startup_timeout is not None
+                else self._request_timeout
+            )
+        )
+        request_client = self._with_request_timeout(wait_timeout)
+        deadline = time.monotonic() + wait_timeout
+
+        # claim() never sends `name` to the server, so only the create() path
+        # may fall back to the requested name when caching info locally.
+        if pool_id is not None and auto_resume is not None:
+            raise SandboxError("auto_resume cannot be set when claiming from a pool")
+        requested_name = None if pool_id is not None else name
+        if pool_id is not None:
+            result = request_client.claim(pool_id, file_systems=file_systems)
+        else:
+            # The server waits on its own state changes and answers as soon
+            # as the sandbox runs, fails, or the request timeout (less a
+            # response grace) runs out. A timed-out sandbox stays queued.
+            result = request_client._create_and_wait(
+                image=image,
+                cpus=cpus,
+                memory_mb=memory_mb,
+                disk_mb=disk_mb,
+                gpus=gpus,
+                gpu_model=gpu_model,
+                timeout_secs=timeout_secs,
+                entrypoint=entrypoint,
+                allow_internet_access=allow_internet_access,
+                allow_out=allow_out,
+                deny_out=deny_out,
+                snapshot_id=snapshot_id,
+                allow_unauthenticated_access=allow_unauthenticated_access,
+                exposed_ports=exposed_ports,
+                name=name,
+                file_systems=file_systems,
+                gpu=gpu,
+                max_pending_secs=max_pending_secs,
+                auto_resume=auto_resume,
+            )
+        if result.status == SandboxStatus.RUNNING:
+            sandbox = request_client.connect(
+                result.sandbox_id,
+                proxy_url=proxy_url,
+                routing_hint=result.routing_hint,
+                request_timeout=wait_timeout,
+                _routing_info=result,
+            )
+            sandbox._sandbox_id = result.sandbox_id
+            sandbox._owns_sandbox = True
+            sandbox._lifecycle_client = request_client
+            sandbox._trace_id = result.trace_id
+            sandbox._cached_info = SandboxInfo.model_construct(
+                sandbox_id=result.sandbox_id,
+                status=result.status,
+                ingress_endpoint=result.ingress_endpoint,
+                sandbox_url=result.sandbox_url,
+                name=result.name or requested_name,
+            )
+            return sandbox
+        if result.status in (
+            SandboxStatus.SUSPENDED,
+            SandboxStatus.TERMINATED,
+            SandboxStatus.FAILED,
+        ):
+            raise _startup_failure(
+                result.sandbox_id,
+                result.status,
+                error_details=result.error_details,
+                termination_reason=result.termination_reason or result.reason,
+            )
+        sandbox_id = result.sandbox_id
+        trace_id = result.trace_id
+
+        # A `timeout` answer: the sandbox exists and keeps its place in the
+        # queue. Poll it with whatever budget is left (a zero budget observes
+        # its state once without sleeping).
+        observed = request_client._wait_for_sandbox(
+            sandbox_id, _remaining_budget(deadline), poll_interval
+        )
+        return request_client._settle_wait(
+            observed,
+            budget=wait_timeout,
+            proxy_url=proxy_url,
+            request_timeout=wait_timeout,
+            cancel_on_timeout=cancel_on_timeout,
+            requested_name=requested_name,
+            owns_sandbox=True,
+            trace_id=trace_id,
+        )

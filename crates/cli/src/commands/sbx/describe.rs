@@ -1,0 +1,333 @@
+use crate::auth::context::CliContext;
+use crate::commands::sbx::{
+    DEFAULT_SANDBOX_IMAGE_DISPLAY_NAME, SandboxFailureDetails, SandboxTimestamp,
+    error_details_message, format_gpu_allocation, native_ssh, sandbox_endpoint,
+};
+use crate::error::{CliError, Result};
+use crate::output::terminal::message;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct SandboxDescription {
+    #[serde(alias = "id")]
+    sandbox_id: Option<String>,
+    name: Option<String>,
+    namespace: Option<String>,
+    status: Option<String>,
+    runtime: Option<String>,
+    #[serde(flatten)]
+    failure: SandboxFailureDetails,
+    resources: Option<SandboxResources>,
+    resource_resize: Option<tensorlake::sandboxes::models::SandboxResourceResizeInfo>,
+    #[serde(alias = "allow_unauthenticated_proxy_access")]
+    allow_unauthenticated_access: Option<bool>,
+    network_policy: Option<SandboxNetwork>,
+    created_at: Option<SandboxTimestamp>,
+    terminated_at: Option<SandboxTimestamp>,
+    archived_at: Option<SandboxTimestamp>,
+    timeout_secs: Option<i64>,
+    #[serde(alias = "sandboxUrl")]
+    sandbox_url: Option<String>,
+    entrypoint: Option<Vec<String>>,
+    #[serde(alias = "exposedPorts")]
+    exposed_ports: Option<Vec<u64>>,
+    outcome: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SandboxResources {
+    cpus: Option<f64>,
+    memory_mb: Option<i64>,
+    disk_mb: Option<i64>,
+    ephemeral_disk_mb: Option<i64>,
+    #[serde(default, alias = "gpus")]
+    gpu_configs: Option<Vec<tensorlake::sandboxes::models::GPUResources>>,
+}
+
+#[derive(Deserialize)]
+struct SandboxNetwork {
+    allow_internet_access: Option<bool>,
+    allow_out: Option<Vec<String>>,
+    deny_out: Option<Vec<String>>,
+}
+
+pub async fn run(ctx: &CliContext, sandbox_id: &str) -> Result<()> {
+    let client = ctx.client()?;
+    let url = sandbox_endpoint(ctx, &format!("sandboxes/{sandbox_id}"));
+
+    let resp = client.get(&url).send().await.map_err(CliError::Http)?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return run_archived(ctx, sandbox_id).await;
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CliError::Other(anyhow::anyhow!(
+            "failed to fetch sandbox '{}' (HTTP {}): {}",
+            sandbox_id,
+            status,
+            body
+        )));
+    }
+
+    let item = resp
+        .json::<SandboxDescription>()
+        .await
+        .map_err(CliError::Http)?;
+    print_sandbox_details(&item);
+    print_ssh_config_details(&item)?;
+    Ok(())
+}
+
+async fn run_archived(ctx: &CliContext, sandbox_id: &str) -> Result<()> {
+    let client = ctx.client()?;
+    let url = sandbox_endpoint(ctx, &format!("archived-sandboxes/{sandbox_id}"));
+
+    let resp = client.get(&url).send().await.map_err(CliError::Http)?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(CliError::Other(anyhow::anyhow!(
+            "sandbox '{}' not found",
+            sandbox_id
+        )));
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CliError::Other(anyhow::anyhow!(
+            "failed to fetch archived sandbox '{}' (HTTP {}): {}",
+            sandbox_id,
+            status,
+            body
+        )));
+    }
+
+    let item = resp
+        .json::<SandboxDescription>()
+        .await
+        .map_err(CliError::Http)?;
+    print_archived_sandbox_details(&item);
+    print_ssh_config_details(&item)?;
+    Ok(())
+}
+
+fn print_archived_sandbox_details(item: &SandboxDescription) {
+    print_sandbox_details(item);
+    let archived_at = item
+        .archived_at
+        .as_ref()
+        .map(SandboxTimestamp::format)
+        .unwrap_or_default();
+    println!("Archived:        {}", archived_at);
+}
+
+fn print_sandbox_details(item: &SandboxDescription) {
+    let id = item.sandbox_id.as_deref().unwrap_or("-");
+    let name = item.name.as_deref().unwrap_or("");
+    let status = item.status.as_deref().unwrap_or("-");
+    let image = item
+        .failure
+        .image
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_SANDBOX_IMAGE_DISPLAY_NAME);
+    let namespace = item.namespace.as_deref().unwrap_or("-");
+
+    println!("ID:              {}", id);
+    println!("Name:            {}", name);
+    println!("Namespace:       {}", namespace);
+    println!("Status:          {}", status);
+    println!("Image:           {}", image);
+    println!(
+        "Runtime:         {}",
+        item.runtime.as_deref().unwrap_or("-")
+    );
+
+    let resources = item.resources.as_ref();
+    let cpus = resources
+        .and_then(|r| r.cpus)
+        .map(|v| format!("{}", v))
+        .unwrap_or_else(|| "-".to_string());
+    let memory = resources
+        .and_then(|r| r.memory_mb)
+        .map(|v| format!("{} MiB", v))
+        .unwrap_or_else(|| "-".to_string());
+    let disk = resources
+        .and_then(|r| r.disk_mb.or(r.ephemeral_disk_mb))
+        .map(|v| format!("{} MiB", v))
+        .unwrap_or_else(|| "-".to_string());
+    println!("CPUs:            {}", cpus);
+    println!("Memory:          {}", memory);
+    println!("Disk:            {}", disk);
+    println!(
+        "GPUs:            {}",
+        format_gpu_allocation(
+            resources
+                .and_then(|r| r.gpu_configs.as_deref())
+                .unwrap_or_default()
+        )
+    );
+    if let Some(resize) = &item.resource_resize {
+        println!(
+            "Resize:          generation {}: {}",
+            resize.generation, resize.status
+        );
+        println!(
+            "Requested:       {} CPUs, {} MiB memory, {} MiB disk",
+            resize.requested.cpus, resize.requested.memory_mb, resize.requested.disk_mb
+        );
+        if let Some(error) = &resize.error_message {
+            println!("Resize error:    {}", message(error));
+        }
+    }
+
+    let allow_unauthenticated = item.allow_unauthenticated_access.unwrap_or(false);
+    println!(
+        "Proxy auth:      {}",
+        if allow_unauthenticated {
+            "unauthenticated"
+        } else {
+            "required"
+        }
+    );
+
+    let network = item.network_policy.as_ref();
+    let internet = network
+        .and_then(|n| n.allow_internet_access)
+        .unwrap_or(true);
+    println!(
+        "Internet:        {}",
+        if internet { "allowed" } else { "blocked" }
+    );
+
+    println!(
+        "Created:         {}",
+        item.created_at
+            .as_ref()
+            .map(SandboxTimestamp::format)
+            .unwrap_or_else(|| "-".to_string())
+    );
+
+    // Optional fields
+    let timeout = item
+        .timeout_secs
+        .map(|v| format!("{}s", v))
+        .unwrap_or_default();
+    println!("Timeout:         {}", timeout);
+
+    let sandbox_url = item.sandbox_url.as_deref().unwrap_or("");
+    println!("URL:             {}", sandbox_url);
+
+    let entrypoint = item
+        .entrypoint
+        .as_ref()
+        .map(|args| args.join(" "))
+        .unwrap_or_default();
+    println!("Entrypoint:      {}", entrypoint);
+
+    let ports = item
+        .exposed_ports
+        .as_ref()
+        .map(|ports| {
+            ports
+                .iter()
+                .map(|port| port.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    println!("Ports:           {}", ports);
+
+    let allow_out = network
+        .and_then(|n| n.allow_out.as_ref())
+        .map(|rules| rules.join(", "))
+        .unwrap_or_default();
+    println!("Allow out:       {}", allow_out);
+
+    let deny_out = network
+        .and_then(|n| n.deny_out.as_ref())
+        .map(|rules| rules.join(", "))
+        .unwrap_or_default();
+    println!("Deny out:        {}", deny_out);
+
+    // Termination group — only shown for terminated sandboxes
+    if status.eq_ignore_ascii_case("terminated") {
+        let terminated_at = item
+            .terminated_at
+            .as_ref()
+            .map(SandboxTimestamp::format)
+            .unwrap_or_default();
+        println!("Terminated:      {}", terminated_at);
+
+        let reason = item.failure.termination_reason.as_deref().unwrap_or("");
+        println!("Reason:          {}", message(reason));
+        if let Some(details) = item
+            .failure
+            .error_details
+            .as_ref()
+            .and_then(error_details_message)
+        {
+            // Error details can carry text from inside the sandbox.
+            println!("Error details:   {}", message(&details));
+        }
+
+        let outcome = item.outcome.as_deref().unwrap_or("");
+        println!("Outcome:         {}", outcome);
+    }
+}
+
+fn print_ssh_config_details(item: &SandboxDescription) -> Result<()> {
+    // Terminated sandboxes have no routable guest. Their diagnosis must remain
+    // inspectable even when the server has already removed sandbox_url.
+    if item
+        .status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("terminated"))
+    {
+        return Ok(());
+    }
+    let id = item
+        .sandbox_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    let name = item.name.as_deref();
+    let sandbox_url = item.sandbox_url.as_deref();
+    let sandbox = native_ssh::ResolvedSandbox::with_sandbox_url(id, name, sandbox_url)?;
+    let config = native_ssh::format_ssh_config(&sandbox, None, None)?;
+
+    println!("SSH Config:");
+    print!("{config}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SandboxDescription;
+
+    fn parse(extra: &str) -> SandboxDescription {
+        serde_json::from_str(&format!(r#"{{"id":"sbx-1","status":"running"{extra}}}"#))
+            .expect("parse sandbox description")
+    }
+
+    #[test]
+    fn describe_reads_network_policy() {
+        let current = parse(r#","network_policy":{"allow_internet_access":false}"#);
+        assert_eq!(
+            current
+                .network_policy
+                .as_ref()
+                .and_then(|n| n.allow_internet_access),
+            Some(false)
+        );
+
+        // `network` is the request key and is not an alias for the response.
+        let request_key = parse(r#","network":{"allow_internet_access":false}"#);
+        assert!(request_key.network_policy.is_none());
+
+        assert!(parse("").network_policy.is_none());
+    }
+}

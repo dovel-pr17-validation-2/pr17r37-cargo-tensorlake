@@ -1,0 +1,194 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { NativeStub } from "./native-stub.js";
+
+class MockWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 3;
+  static instances: MockWebSocket[] = [];
+  static failOnOpen = false;
+
+  readonly url: string;
+  readonly options: { headers?: Record<string, string> } | undefined;
+  readonly sent: Buffer[] = [];
+  readyState = MockWebSocket.CONNECTING;
+
+  private readonly handlers: Record<string, ((...args: any[]) => void)[]> = {};
+
+  constructor(url: string, options?: { headers?: Record<string, string> }) {
+    this.url = url;
+    this.options = options;
+    MockWebSocket.instances.push(this);
+    queueMicrotask(() => {
+      if (MockWebSocket.failOnOpen) {
+        this.emit("error", new Error("mock websocket connect failure"));
+        this.emitClose(1011, "mock websocket connect failure");
+        return;
+      }
+      this.readyState = MockWebSocket.OPEN;
+      this.emit("open");
+    });
+  }
+
+  on(event: string, handler: (...args: any[]) => void): this {
+    this.handlers[event] ??= [];
+    this.handlers[event].push(handler);
+    return this;
+  }
+
+  send(data: Buffer | Uint8Array, cb?: (error?: Error) => void): void {
+    this.sent.push(Buffer.from(data));
+    cb?.();
+  }
+
+  close(code = 1000, reason = "client disconnect"): void {
+    this.readyState = MockWebSocket.CLOSED;
+    this.emit("close", code, Buffer.from(reason, "utf8"));
+  }
+
+  emitMessage(data: Buffer): void {
+    this.emit("message", data);
+  }
+
+  emitClose(code: number, reason = ""): void {
+    this.readyState = MockWebSocket.CLOSED;
+    this.emit("close", code, Buffer.from(reason, "utf8"));
+  }
+
+  private emit(event: string, ...args: any[]): void {
+    for (const handler of this.handlers[event] ?? []) {
+      handler(...args);
+    }
+  }
+}
+
+vi.mock("ws", () => ({
+  default: MockWebSocket,
+}));
+
+describe("Sandbox PTY", () => {
+  let Sandbox: typeof import("../src/sandbox.js").Sandbox;
+  let installNativeStub: typeof import("./native-stub.js").installNativeStub;
+  let clearNativeStub: typeof import("./native-stub.js").clearNativeStub;
+
+  beforeEach(async () => {
+    MockWebSocket.instances = [];
+    MockWebSocket.failOnOpen = false;
+    // Reset modules so `sandbox.js` (which imports `ws` at module load) is
+    // re-evaluated against the hoisted `ws` mock. The native-stub helpers must
+    // be re-imported from the same fresh module graph so they target the same
+    // `native-sandbox.js` binding cache that `sandbox.js` reads.
+    vi.resetModules();
+    ({ Sandbox } = await import("../src/sandbox.js"));
+    ({ installNativeStub, clearNativeStub } = await import("./native-stub.js"));
+  });
+
+  afterEach(() => {
+    clearNativeStub();
+    vi.restoreAllMocks();
+  });
+
+  /** Install a native stub whose createPtySession returns the given session. */
+  function installPtyStub(sessionId: string, token: string): NativeStub {
+    return installNativeStub({
+      proxy: {
+        createPtySession: vi.fn(async () => ({
+          traceId: "t",
+          json: JSON.stringify({ session_id: sessionId, token }),
+        })),
+      },
+    });
+  }
+
+  function makeSandbox() {
+    return new Sandbox({
+      sandboxId: "sbx-1",
+      proxyUrl: "https://sandbox.tensorlake.ai",
+      apiKey: "test-api-key",
+    });
+  }
+
+  it("creates a PTY handle, sends READY, streams data, and waits for exit", async () => {
+    installPtyStub("sess-1", "tok-1");
+
+    const onData = vi.fn();
+    const onExit = vi.fn();
+    const sandbox = makeSandbox();
+    const pty = await sandbox.createPty({
+      command: "/bin/bash",
+      onData,
+      onExit,
+    });
+
+    const socket = MockWebSocket.instances[0];
+    expect(socket.url).toBe(
+      "wss://sandbox.tensorlake.ai/api/v1/pty/sess-1/ws",
+    );
+    expect(socket.options?.headers?.["X-PTY-Token"]).toBe("tok-1");
+    expect(socket.sent[0]).toEqual(Buffer.from([0x02]));
+
+    socket.emitMessage(Buffer.from([0x00, 0x68, 0x69]));
+    expect(new Uint8Array(onData.mock.calls[0][0] as Uint8Array)).toEqual(
+      new Uint8Array([0x68, 0x69]),
+    );
+
+    socket.emitMessage(Buffer.from([0x03, 0x00, 0x00, 0x00, 0x07]));
+    await expect(pty.wait()).resolves.toBe(7);
+    expect(onExit).toHaveBeenCalledWith(7);
+  });
+
+  it("sends input and resize frames", async () => {
+    installPtyStub("sess-2", "tok-2");
+
+    const sandbox = makeSandbox();
+    const pty = await sandbox.createPty({ command: "/bin/bash" });
+    const socket = MockWebSocket.instances[0];
+
+    await pty.sendInput("pwd\n");
+    await pty.resize(120, 40);
+
+    expect(socket.sent[1]).toEqual(Buffer.from([0x00, 0x70, 0x77, 0x64, 0x0a]));
+    expect(socket.sent[2]).toEqual(Buffer.from([0x01, 0x00, 0x78, 0x00, 0x28]));
+  });
+
+  it("disconnects and reconnects the same PTY handle", async () => {
+    installPtyStub("sess-3", "tok-3");
+
+    const sandbox = makeSandbox();
+    const pty = await sandbox.createPty({ command: "/bin/bash" });
+    const firstSocket = MockWebSocket.instances[0];
+
+    pty.disconnect();
+    expect(firstSocket.readyState).toBe(MockWebSocket.CLOSED);
+
+    await pty.connect();
+    const secondSocket = MockWebSocket.instances[1];
+    expect(secondSocket).not.toBe(firstSocket);
+    expect(secondSocket.sent[0]).toEqual(Buffer.from([0x02]));
+
+    secondSocket.emitClose(1000, "exit:0");
+    await expect(pty.wait()).resolves.toBe(0);
+  });
+
+  it("kills a PTY session through the native client", async () => {
+    const handle = installPtyStub("sess-4", "tok-4");
+
+    const sandbox = makeSandbox();
+    const pty = await sandbox.createPty({ command: "/bin/bash" });
+
+    await expect(pty.kill()).resolves.toBeUndefined();
+    expect(handle.proxy.deletePtySession).toHaveBeenCalledWith("sess-4");
+  });
+
+  it("cleans up the created PTY session when the initial websocket attach fails", async () => {
+    MockWebSocket.failOnOpen = true;
+    const handle = installPtyStub("sess-fail", "tok-fail");
+
+    const sandbox = makeSandbox();
+    await expect(
+      sandbox.createPty({ command: "/bin/bash" }),
+    ).rejects.toThrow(/mock websocket connect failure|READY completed/);
+
+    expect(handle.proxy.deletePtySession).toHaveBeenCalledWith("sess-fail");
+  });
+});

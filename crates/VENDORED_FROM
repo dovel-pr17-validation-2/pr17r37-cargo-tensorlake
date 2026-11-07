@@ -1,0 +1,50 @@
+Private client sources from artifact_storage: NOTHING is vendored into this public repo.
+
+crates/gsvc-mount, crates/gsvc-codec, and crates/gsvc-fs-client are resolution-only placeholders
+(compile_error! bodies). The real sources live in the private tensorlakeai/artifact_storage repo and
+are swapped in EPHEMERALLY only for builds that enable the features needing them (`mount`,
+`git-clone`):
+
+  * locally:  just build-cli-full   — copies the private client sources from a sibling
+              ../artifact_storage checkout for the build, restoring the placeholders afterward
+  * CI:       .github/actions/vendor-private-crates — mints a short-lived GitHub App token
+              (ARTIFACT_STORAGE_APP_ID / _PRIVATE_KEY), sparse-checks-out the required sources,
+              and swaps them over the placeholders for the job only
+
+Staging copies the complete src tree, including nested Rust modules and embedded assets.
+CI compares the staged tree with the private checkout before compiling.
+CI and CLI releases pin all three crates and the FSKit companion sources to the merged AS commit
+in crates/ARTIFACT_STORAGE_REVISION. Update that pin in a reviewed companion PR to consume AS fixes.
+
+The swapped source compiles against the PLACEHOLDER manifests, so each placeholder Cargo.toml's
+dependency list must mirror the corresponding artifact_storage crate. If upstream dependencies
+change, update the placeholder manifest in the same companion change. Native filesystem SDK and
+wire behavior compile entirely inside `gsvc-fs-client`; the published `tensorlake` SDK has no native
+filesystem module.
+
+Wire-format coupling still applies even without vendoring: the fast-clone client
+(crates/cli/src/commands/git/fastclone.rs) and the ingest client
+(crates/cloud-sdk/src/artifact_storage/ingest.rs) duplicate artifact_storage wire types
+(FastCloneManifest and friends, ingest request/response shapes). If those change upstream, open
+a companion PR here.
+
+Function Agent: NO core or function-specific native-binding implementation source is vendored into
+this public repo.
+
+`crates/function-agent-core` is a resolution placeholder for the canonical private crate at
+`compute-engine-internal/function-service/agent-core`. The function-agent modules included by the
+combined Python and Node extensions are placeholders for CEI's canonical binding modules. The full
+CEI commit in `crates/function-agent-core/CEI_REVISION` is injected ephemerally:
+
+  * locally:  `just with-function-agent-core <command>` copies from a sibling CEI checkout and
+              restores the placeholder after the command
+  * CI:       `.github/actions/vendor-function-agent-core` mints a short-lived GitHub App token,
+              sparse-checks out the pinned CEI crate, and stages it for the job
+  * CEI CI:   the same action receives the current local CEI crate, so service and SDK acceptance
+              always compile one source tree instead of coordinating source-copy branches
+
+The placeholder manifest is checked against CEI during staging and intentionally differs only by
+selecting `tls-ring` instead of CEI's `tls-aws-lc` default. Staging carries every core crate input
+and both language bindings, and records an explicit SHA marker so stale files are never accepted as
+trusted source. Function Service remains the durable state and fencing authority; the injected
+core is its disposable worker half.

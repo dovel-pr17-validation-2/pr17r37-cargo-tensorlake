@@ -1,0 +1,501 @@
+//! # Tensorlake Cloud SDK
+//!
+//! A Rust SDK for interacting with Tensorlake Cloud APIs.
+//! This SDK provides a high-level, ergonomic interface for managing applications,
+//! functions, and execution requests in the Tensorlake Cloud platform.
+//!
+//! ## Quick Start
+//!
+//! ```rust,no_run
+//! use tensorlake::{Sdk, applications::models::ListApplicationsRequest};
+//!
+//! async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Create the SDK client
+//!     let sdk = Sdk::new("https://api.tensorlake.ai", "your-api-key")?;
+//!
+//!     // Get the applications client
+//!     let apps_client = sdk.applications();
+//!
+//!     // List applications in the default namespace
+//!     let request = ListApplicationsRequest::builder()
+//!         .namespace("default".to_string())
+//!         .build()?;
+//!     apps_client.list(&request).await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Authentication
+//!
+//! The SDK uses Bearer token authentication, either a Personal Access Token (PAT) or a Project API key.
+//! Provide your token when creating the SDK:
+//!
+//! ```rust,no_run
+//! use tensorlake::Sdk;
+//!
+//! let sdk = Sdk::new("https://api.tensorlake.ai", "your-token").unwrap();
+//! ```
+//!
+//! ## Available Clients
+//!
+//! - [`ApplicationsClient`](applications::ApplicationsClient): Manage applications, functions, and requests
+//! - [`ImagesClient`](images::ImagesClient): Build and manage container images
+//! - [`SandboxesClient`](sandboxes::SandboxesClient): Manage sandbox lifecycle, pools, and snapshots
+//! - [`SecretsClient`](secrets::SecretsClient): Manage secrets for secure configuration
+//!
+//! ## Error Handling
+//!
+//! The SDK provides detailed error types for different scenarios:
+//!
+//! ```rust,no_run
+//! use tensorlake::{Sdk, applications::models::ListApplicationsRequest};
+//!
+//! async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//!     let sdk = Sdk::new("https://api.tensorlake.ai", "your-api-key")?;
+//!     let apps_client = sdk.applications();
+//!
+//!     let request = ListApplicationsRequest::builder()
+//!         .namespace("default".to_string())
+//!         .build()?;
+//!     match apps_client.list(&request).await {
+//!         Ok(apps) => println!("Success: {:?}", apps.applications.len()),
+//!         Err(e) => eprintln!("Error: {}", e),
+//!     }
+//!     Ok(())
+//! }
+//! ```
+
+pub mod applications;
+pub mod artifact_storage;
+pub mod cron;
+pub mod docker_config;
+pub mod error;
+pub mod http_transport;
+pub mod image_builds;
+mod image_service_builds;
+pub mod images;
+pub mod retry;
+pub mod sandbox_image_catalog;
+pub mod sandbox_images;
+pub mod sandbox_templates;
+pub mod sandboxes;
+pub mod secrets;
+pub mod sse;
+pub mod usage;
+use applications::*;
+use artifact_storage::*;
+use cron::*;
+use images::*;
+use sandbox_templates::*;
+use sandboxes::*;
+use secrets::*;
+use usage::UsageClient;
+
+mod client;
+pub use client::{Client, ClientBuilder, ReadRetryConfig, Traced};
+
+/// Environment variable that overrides the sandbox API (lifecycle) base URL.
+///
+/// Set it to the origin of the sandbox proxy that should receive sandbox
+/// create, list, snapshot and pool requests, e.g. a dedicated BYOC proxy such
+/// as `https://byoc-<customer>.tensorlake.ai`. It is distinct from
+/// `TENSORLAKE_SANDBOX_PROXY_URL`, which only affects per-sandbox handles.
+pub const SANDBOX_API_URL_ENV: &str = "TENSORLAKE_SANDBOX_API_URL";
+
+/// Derive the sandbox lifecycle base URL from the API URL.
+///
+/// `TENSORLAKE_SANDBOX_API_URL`, when set to an absolute `http(s)` URL, wins.
+/// Otherwise `api.tensorlake.*` becomes `sandbox.tensorlake.*` (keeping any
+/// scheme, port and path) and localhost is unchanged.
+pub fn resolve_sandbox_lifecycle_url(api_url: &str) -> String {
+    if let Some(url) = sandbox_api_url_override() {
+        return url;
+    }
+    resolve_sandbox_lifecycle_url_from_api_url(api_url)
+}
+
+/// The validated `TENSORLAKE_SANDBOX_API_URL` override, if set and usable.
+///
+/// Callers that build sandbox lifecycle URLs by a path other than
+/// [`resolve_sandbox_lifecycle_url`] (the CLI's localhost mode) consult this
+/// so the override applies regardless of what the API URL points at.
+pub fn sandbox_api_url_override() -> Option<String> {
+    let raw = std::env::var(SANDBOX_API_URL_ENV).ok()?;
+    normalize_sandbox_api_url(&raw)
+}
+
+/// Accept only absolute `http(s)` URLs with a host and nothing after the
+/// path: no query string, fragment or credentials, since callers append
+/// `/sandboxes` and the like as text. Whitespace and one trailing slash are
+/// trimmed so the value joins cleanly.
+fn normalize_sandbox_api_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = url::Url::parse(trimmed).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    if parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    Some(trimmed.trim_end_matches('/').to_string())
+}
+
+fn resolve_sandbox_lifecycle_url_from_api_url(api_url: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(api_url)
+        && let Some(host) = parsed.host_str()
+    {
+        if host == "localhost" || host == "127.0.0.1" {
+            return api_url.to_string();
+        }
+        if let Some(rest) = host.strip_prefix("api.") {
+            let new_host = format!("sandbox.{rest}");
+            if parsed.set_host(Some(&new_host)).is_ok() {
+                return parsed.to_string().trim_end_matches('/').to_string();
+            }
+        }
+    }
+    "https://sandbox.tensorlake.ai".to_string()
+}
+
+#[cfg(test)]
+mod sandbox_lifecycle_url_tests {
+    use super::*;
+
+    #[test]
+    fn derives_sandbox_host_from_api_host() {
+        assert_eq!(
+            resolve_sandbox_lifecycle_url_from_api_url("https://api.tensorlake.ai"),
+            "https://sandbox.tensorlake.ai"
+        );
+        assert_eq!(
+            resolve_sandbox_lifecycle_url_from_api_url("https://api.tensorlake.dev/"),
+            "https://sandbox.tensorlake.dev"
+        );
+        assert_eq!(
+            resolve_sandbox_lifecycle_url_from_api_url("http://api.example.test:8443"),
+            "http://sandbox.example.test:8443"
+        );
+        assert_eq!(
+            resolve_sandbox_lifecycle_url_from_api_url("http://localhost:8900"),
+            "http://localhost:8900"
+        );
+        assert_eq!(
+            resolve_sandbox_lifecycle_url_from_api_url("https://custom.example.test"),
+            "https://sandbox.tensorlake.ai"
+        );
+    }
+
+    #[test]
+    fn override_accepts_only_absolute_http_origins() {
+        assert_eq!(
+            normalize_sandbox_api_url(" https://byoc-acme.tensorlake.ai/ "),
+            Some("https://byoc-acme.tensorlake.ai".to_string())
+        );
+        assert_eq!(
+            normalize_sandbox_api_url("http://127.0.0.1:9443"),
+            Some("http://127.0.0.1:9443".to_string())
+        );
+        assert_eq!(normalize_sandbox_api_url(""), None);
+        assert_eq!(normalize_sandbox_api_url("   "), None);
+        assert_eq!(normalize_sandbox_api_url("byoc-acme.tensorlake.ai"), None);
+        assert_eq!(
+            normalize_sandbox_api_url("ftp://byoc-acme.tensorlake.ai"),
+            None
+        );
+    }
+
+    #[test]
+    fn override_rejects_anything_after_the_path() {
+        // Callers append `/sandboxes` as text; a query string would end up in
+        // the middle of the path and a fragment would be dropped by the client.
+        assert_eq!(
+            normalize_sandbox_api_url("https://byoc-acme.tensorlake.ai?q=1"),
+            None
+        );
+        assert_eq!(
+            normalize_sandbox_api_url("https://byoc-acme.tensorlake.ai/#fragment"),
+            None
+        );
+        assert_eq!(
+            normalize_sandbox_api_url("https://user:pw@byoc-acme.tensorlake.ai"),
+            None
+        );
+        // A path prefix still joins cleanly.
+        assert_eq!(
+            normalize_sandbox_api_url("https://byoc-acme.tensorlake.ai/proxy/"),
+            Some("https://byoc-acme.tensorlake.ai/proxy".to_string())
+        );
+    }
+}
+
+/// Derive the Artifact Storage Git base URL from the API URL.
+///
+/// Converts `api.tensorlake.*` -> `git.tensorlake.*`. Localhost is unchanged.
+pub fn resolve_artifact_storage_url(api_url: &str) -> String {
+    artifact_storage::resolve_artifact_storage_url(api_url)
+}
+
+/// The main entry point for the Tensorlake Cloud SDK.
+///
+/// The `Sdk` struct provides a unified interface to all Tensorlake Cloud services.
+/// It manages authentication and provides access to various service clients.
+///
+/// ## Example
+///
+/// ```rust
+/// use tensorlake::Sdk;
+///
+/// let sdk = Sdk::new("https://api.tensorlake.ai", "your-api-key").unwrap();
+///
+/// // Access different service clients
+/// let apps_client = sdk.applications();
+/// let secrets_client = sdk.secrets();
+/// ```
+#[derive(Clone)]
+pub struct Sdk {
+    client: Client,
+    api_url: String,
+}
+
+impl Sdk {
+    /// Create a new SDK instance with the specified base URL and bearer token.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_url` - The base URL of the Tensorlake Cloud API (e.g., "https://api.tensorlake.ai")
+    /// * `bearer_token` - Your API key for authentication
+    ///
+    /// # Returns
+    ///
+    /// Returns a new `Sdk` instance configured with the provided credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created or configured.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tensorlake::Sdk;
+    ///
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let sdk = Sdk::new("https://api.tensorlake.ai", "your-api-key").unwrap();
+    /// Ok(())
+    /// # }
+    /// ```
+    pub fn new(base_url: &str, bearer_token: &str) -> Result<Self, error::SdkError> {
+        let client = ClientBuilder::new(base_url)
+            .bearer_token(bearer_token)
+            .build()?;
+        Ok(Self {
+            client,
+            api_url: base_url.to_string(),
+        })
+    }
+
+    /// Create a new SDK instance using a client builder.
+    ///
+    /// This method allows for more flexible configuration of the SDK client,
+    /// including custom middleware, bearer tokens, and organization/project scopes.
+    ///
+    /// # Arguments
+    ///
+    /// * `builder` - A configured [`ClientBuilder`]
+    ///
+    /// # Returns
+    ///
+    /// Returns a new `Sdk` instance configured with the builder's settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created or configured.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tensorlake::{Sdk, ClientBuilder};
+    ///
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let builder = ClientBuilder::new("https://api.tensorlake.ai")
+    ///     .bearer_token("your-api-key")
+    ///     .scope("org-id", "project-id");
+    /// let sdk = Sdk::with_client_builder(builder)?;
+    /// Ok(())
+    /// # }
+    /// ```
+    pub fn with_client_builder(builder: ClientBuilder) -> Result<Self, error::SdkError> {
+        let api_url = builder.base_url().to_string();
+        let client = builder.build()?;
+        Ok(Self { client, api_url })
+    }
+
+    /// Get a client for managing applications and requests.
+    ///
+    /// This method returns an [`ApplicationsClient`] that provides methods for:
+    /// - Listing, creating, updating, and deleting applications
+    /// - Invoking applications with data
+    /// - Managing execution requests
+    ///
+    /// # Returns
+    ///
+    /// Returns an [`ApplicationsClient`] instance configured with the SDK's authentication.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tensorlake::{Sdk, applications::models::ListApplicationsRequest};
+    ///
+    /// async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let sdk = Sdk::new("https://api.tensorlake.ai", "your-api-key")?;
+    ///     let apps_client = sdk.applications();
+    ///
+    ///     // Use the applications client
+    ///     let request = ListApplicationsRequest::builder()
+    ///         .namespace("default".to_string())
+    ///         .build()?;
+    ///     apps_client.list(&request).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn applications(&self) -> ApplicationsClient {
+        ApplicationsClient::new(self.client.clone())
+    }
+
+    /// Get a client for building and managing container images.
+    ///
+    /// This method returns an [`ImagesClient`] that provides methods for:
+    /// - Building container images from source code and Dockerfiles
+    /// - Monitoring build progress and status
+    ///
+    /// # Returns
+    ///
+    /// Returns an [`ImagesClient`] instance configured with the SDK's authentication.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use tensorlake::Sdk;
+    ///
+    /// let sdk = Sdk::new("https://api.tensorlake.ai", "your-api-key").unwrap();
+    /// let images_client = sdk.images();
+    ///
+    /// // Use the images client
+    /// // let result = images_client.build_image(request).await?;
+    /// ```
+    pub fn images(&self) -> ImagesClient {
+        ImagesClient::new(self.client.clone())
+    }
+
+    /// Get a client for Artifact Storage repositories and Git credentials.
+    pub fn artifact_storage(&self) -> Result<ArtifactStorageClient, error::SdkError> {
+        ArtifactStorageClient::new(
+            self.client.clone(),
+            resolve_artifact_storage_url(&self.api_url),
+        )
+    }
+
+    /// Get a client for Artifact Storage using an explicit Git/data-plane base URL.
+    pub fn artifact_storage_with_url(
+        &self,
+        git_base_url: &str,
+    ) -> Result<ArtifactStorageClient, error::SdkError> {
+        ArtifactStorageClient::new(self.client.clone(), git_base_url)
+    }
+
+    /// Get an Artifact Storage client whose data-plane requests use a local
+    /// Unix socket instead of guest networking.
+    #[cfg(unix)]
+    pub fn artifact_storage_with_unix_socket(
+        &self,
+        git_base_url: &str,
+        socket_path: &std::path::Path,
+    ) -> Result<ArtifactStorageClient, error::SdkError> {
+        ArtifactStorageClient::new_with_unix_socket(self.client.clone(), git_base_url, socket_path)
+    }
+
+    /// Get a client for managing snapshot-backed sandbox image registrations.
+    pub fn sandbox_templates(
+        &self,
+        organization_id: &str,
+        project_id: &str,
+    ) -> SandboxTemplatesClient {
+        SandboxTemplatesClient::new(
+            self.client.clone(),
+            organization_id.to_string(),
+            project_id.to_string(),
+        )
+    }
+
+    /// Get a sandbox-template client scoped by the authenticated API key.
+    ///
+    /// Unlike [`Sdk::sandbox_templates`], this client uses the token-scoped
+    /// Platform API routes and does not need organization/project discovery.
+    pub fn sandbox_templates_for_api_key(&self) -> SandboxTemplatesClient {
+        SandboxTemplatesClient::new_api_key_scoped(self.client.clone())
+    }
+
+    /// Get a client for an organization's sandbox usage and attributed cost.
+    pub fn usage(&self, organization_id: &str) -> UsageClient {
+        UsageClient::new(self.client.clone(), organization_id)
+    }
+
+    /// Get a client for managing sandbox lifecycle, pools, and snapshots.
+    ///
+    /// # Arguments
+    ///
+    /// * `namespace` - Namespace used when `use_namespaced_endpoints` is true
+    /// * `use_namespaced_endpoints` - If true, use `/v1/namespaces/{namespace}/...`
+    ///   paths. If false, use cloud-style top-level paths such as `/sandboxes`.
+    pub fn sandboxes(&self, namespace: &str, use_namespaced_endpoints: bool) -> SandboxesClient {
+        let lifecycle_client = self
+            .client
+            .with_base_url(&resolve_sandbox_lifecycle_url(&self.api_url));
+        SandboxesClient::new(
+            lifecycle_client,
+            namespace.to_string(),
+            use_namespaced_endpoints,
+        )
+        .with_log_client(self.client.clone())
+    }
+
+    /// Get a client for managing secrets.
+    ///
+    /// This method returns a [`SecretsClient`] that provides methods for:
+    /// - Creating, updating, and deleting secrets
+    /// - Listing secrets in a project
+    /// - Retrieving individual secret details
+    ///
+    /// # Returns
+    ///
+    /// Returns a [`SecretsClient`] instance configured with the SDK's authentication.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tensorlake::Sdk;
+    ///
+    /// async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let sdk = Sdk::new("https://api.tensorlake.ai", "your-api-key")?;
+    ///     let secrets_client = sdk.secrets();
+    ///
+    ///     // API keys use the token-scoped route directly.
+    ///     secrets_client.list_api_key_scoped(Some(100)).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn secrets(&self) -> SecretsClient {
+        SecretsClient::new(self.client.clone())
+    }
+
+    /// Get a client for managing cron schedules for applications.
+    pub fn cron(&self) -> CronClient {
+        CronClient::new(self.client.clone())
+    }
+}

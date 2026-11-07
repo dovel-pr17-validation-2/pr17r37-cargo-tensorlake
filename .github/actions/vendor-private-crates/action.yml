@@ -1,0 +1,145 @@
+name: Vendor private artifact_storage crates
+description: >
+  Swaps the private filesystem client (including its native SDK), mount core, and packfile codec
+  into the public resolution placeholders so the CLI can be built with `--features
+  mount,git-clone`. Mints a
+  short-lived GitHub App token, sparse-checks-out only those sources from artifact_storage, and
+  copies them over the committed placeholders (keeping workspace-adapted Cargo.tomls).
+  The source is only present on the runner for the duration of the job and is never committed
+  to this public repo.
+
+  The calling workflow must have already run actions/checkout for this repo, and must pass the
+  credentials for a GitHub App that has `contents: read` on tensorlakeai/artifact_storage.
+
+inputs:
+  app-id:
+    description: App ID of a GitHub App with contents:read on tensorlakeai/artifact_storage.
+    required: true
+  private-key:
+    description: Private key (PEM) for that GitHub App.
+    required: true
+  include-macos-fskit:
+    description: >
+      Also stage private macOS FSKit Sources and Resources for consumers that need them.
+      Leave disabled on Linux and Windows so those builds have no Swift source dependency.
+    required: false
+    default: "false"
+  source-ref:
+    description: >
+      Optional full artifact_storage commit SHA. Defaults to crates/ARTIFACT_STORAGE_REVISION
+      so CI and releases consume the same reviewed private source revision.
+    required: false
+    default: ""
+
+outputs:
+  source-sha:
+    description: Exact artifact_storage commit vendored by this invocation.
+    value: ${{ steps.resolved-source.outputs.sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read pinned artifact_storage revision
+      id: source-ref
+      shell: bash
+      env:
+        SOURCE_REF: ${{ inputs.source-ref }}
+      run: |
+        set -euo pipefail
+        sha="$SOURCE_REF"
+        if [ -z "$sha" ]; then
+          sha=$(cat crates/ARTIFACT_STORAGE_REVISION)
+          # Git may check this text file out with CRLF on Windows.
+          sha="${sha%$'\r'}"
+        fi
+        if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::artifact_storage source must be a full commit SHA"
+          exit 1
+        fi
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+    - name: Mint artifact_storage access token
+      id: app-token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: tensorlakeai
+        repositories: artifact_storage
+
+    - name: Check out private crate sources
+      uses: actions/checkout@v4
+      with:
+        repository: tensorlakeai/artifact_storage
+        ref: ${{ steps.source-ref.outputs.sha }}
+        token: ${{ steps.app-token.outputs.token }}
+        path: .mount-core
+        sparse-checkout: |
+          crates/gsvc-mount/src
+          crates/gsvc-codec/src
+          crates/gsvc-fs-client/src
+        sparse-checkout-cone-mode: false
+        persist-credentials: false
+
+    - name: Resolve private source revision
+      id: resolved-source
+      shell: bash
+      run: |
+        set -euo pipefail
+        sha=$(git -C .mount-core rev-parse HEAD)
+        if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::artifact_storage checkout did not resolve to a full commit SHA"
+          exit 1
+        fi
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "Vendoring artifact_storage@$sha"
+
+    - name: Check out private macOS FSKit companions
+      if: ${{ inputs.include-macos-fskit == 'true' }}
+      uses: actions/checkout@v4
+      with:
+        repository: tensorlakeai/artifact_storage
+        ref: ${{ steps.resolved-source.outputs.sha }}
+        token: ${{ steps.app-token.outputs.token }}
+        path: .mount-fskit
+        sparse-checkout: |
+          platform/macos/tlfs/Sources
+          platform/macos/tlfs/Resources
+        sparse-checkout-cone-mode: false
+        persist-credentials: false
+
+    - name: Swap real sources over the placeholders
+      shell: bash
+      run: |
+        set -euo pipefail
+        for crate in gsvc-mount gsvc-codec gsvc-fs-client; do
+          real=".mount-core/crates/${crate}/src"
+          placeholder="crates/${crate}/src"
+          if [ ! -d "$real" ]; then
+            echo "::error::${crate} source not found at $real (checkout of artifact_storage failed?)"
+            exit 1
+          fi
+          # Keep the placeholder's tensorlake-adapted Cargo.toml; replace only the source tree.
+          rm -rf "$placeholder"
+          mkdir -p "$placeholder"
+          cp -R "$real"/. "$placeholder"/
+          diff -qr "$real" "$placeholder"
+          echo "Vendored the complete ${crate} source tree."
+        done
+        echo "The CLI can now build with --features mount,git-clone."
+
+    - name: Stage private macOS FSKit companions
+      if: ${{ inputs.include-macos-fskit == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        real=".mount-fskit/platform/macos/tlfs"
+        destination="platform/macos/tlfs"
+        if [ ! -f "$real/Sources/Extension/TLFS.swift" ] || [ ! -d "$real/Resources" ]; then
+          echo "::error::private macOS FSKit Sources/Resources are incomplete at $real"
+          exit 1
+        fi
+        mkdir -p "$destination"
+        rm -rf "$destination/Sources" "$destination/Resources"
+        cp -R "$real/Sources" "$real/Resources" "$destination/"
+        echo "Vendored the macOS FSKit source companions for this runner."

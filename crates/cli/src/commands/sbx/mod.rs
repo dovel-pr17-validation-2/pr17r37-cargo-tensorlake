@@ -1,0 +1,857 @@
+pub mod copy;
+pub mod cp;
+pub mod create;
+pub mod describe;
+pub mod exec;
+pub mod fs;
+pub mod image;
+pub mod ls;
+pub mod name;
+pub mod native_ssh;
+pub mod port;
+pub mod process;
+pub mod pty;
+mod resize;
+pub mod resume;
+pub mod run;
+pub mod snapshot;
+pub mod snapshot_ls;
+pub mod snapshot_rm;
+pub mod ssh;
+pub mod suspend;
+pub mod terminate;
+pub mod tunnel;
+pub mod update;
+pub mod wait;
+
+use crate::auth::context::CliContext;
+use crate::error::{CliError, Result};
+use chrono::{DateTime, Local, TimeZone, Utc};
+use serde::Deserialize;
+use tensorlake::sandboxes::{
+    models::{GPUResources, NetworkConfig},
+    resolve_default_sandbox_proxy_url, resolve_sandbox_proxy_target as resolve_core_proxy_target,
+    select_sandbox_proxy_url,
+};
+use tokio::time::{Duration, Instant};
+
+#[derive(Debug, Default, Deserialize)]
+struct SandboxFailureDetails {
+    reason: Option<String>,
+    termination_reason: Option<String>,
+    image: Option<String>,
+    // The API permits arbitrary JSON here, including legacy objects and lists.
+    error_details: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct SandboxStatusResponse {
+    status: String,
+    #[serde(default)]
+    pending_reason: Option<String>,
+    #[serde(flatten)]
+    failure: SandboxFailureDetails,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SandboxTimestamp {
+    Rfc3339(String),
+    Numeric(f64),
+}
+
+impl SandboxTimestamp {
+    fn format(&self) -> String {
+        let timestamp = match self {
+            Self::Rfc3339(timestamp) => DateTime::parse_from_rfc3339(timestamp)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc)),
+            Self::Numeric(timestamp) => parse_numeric_timestamp(*timestamp),
+        };
+        format_timestamp(timestamp)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSandboxProxyTarget {
+    pub sandbox_id: String,
+    pub proxy_base: String,
+    pub host_override: Option<String>,
+    pub routing_hint: Option<String>,
+    pub ingress_endpoint: Option<String>,
+    pub sandbox_url: Option<String>,
+}
+
+/// Build the lifecycle API base URL for sandbox CRUD operations.
+///
+/// `TENSORLAKE_SANDBOX_API_URL`, when set, names a sandbox proxy and wins in
+/// every mode: `{override}/sandboxes`. A proxy scopes requests by the API
+/// key, so the flat path applies even when the API URL is a local server.
+/// Otherwise:
+/// Cloud mode: `{sandbox_url}/sandboxes` where sandbox_url = `sandbox.tensorlake.*`
+/// Localhost mode: `{api_url}/v1/namespaces/{namespace}/sandboxes`
+pub fn sandbox_endpoint(ctx: &CliContext, endpoint: &str) -> String {
+    sandbox_endpoint_with(
+        tensorlake::sandbox_api_url_override().as_deref(),
+        &ctx.api_url,
+        &ctx.namespace,
+        endpoint,
+    )
+}
+
+fn sandbox_endpoint_with(
+    override_url: Option<&str>,
+    api_url: &str,
+    namespace: &str,
+    endpoint: &str,
+) -> String {
+    if let Some(override_url) = override_url {
+        return format!("{override_url}/{endpoint}");
+    }
+    if is_localhost(api_url) {
+        format!("{api_url}/v1/namespaces/{namespace}/{endpoint}")
+    } else {
+        format!("{}/{}", resolve_sandbox_lifecycle_url(api_url), endpoint)
+    }
+}
+
+pub fn apply_proxy_access_settings(
+    body: &mut serde_json::Value,
+    ports: &[u16],
+    allow_unauthenticated_access: bool,
+) {
+    if !ports.is_empty() {
+        body["exposed_ports"] = serde_json::json!(ports);
+    }
+
+    if allow_unauthenticated_access || !ports.is_empty() {
+        body["allow_unauthenticated_access"] = serde_json::Value::Bool(true);
+    }
+}
+
+/// Build the CLI's egress policy from its mutually exclusive network modes.
+///
+/// A non-empty `allow_out` is itself a default-drop allowlist in the
+/// dataplane while preserving resolver-scoped DNS. `allow_internet_access`
+/// must therefore remain true for `--network-allow`; false is reserved for
+/// the absolute `--no-internet` mode, which also blocks DNS.
+pub fn build_network_config(
+    no_internet: bool,
+    network_allow: &[String],
+    network_deny: &[String],
+) -> Result<Option<NetworkConfig>> {
+    if no_internet && (!network_allow.is_empty() || !network_deny.is_empty()) {
+        return Err(CliError::usage(
+            "--no-internet cannot be combined with allow or deny rules",
+        ));
+    }
+
+    if !no_internet && network_allow.is_empty() && network_deny.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(NetworkConfig {
+        allow_internet_access: !no_internet,
+        allow_out: network_allow.to_vec(),
+        deny_out: network_deny.to_vec(),
+    }))
+}
+
+/// Image name displayed when a sandbox carries no explicit image (i.e. it
+/// was created from the managed default environment).
+pub const DEFAULT_SANDBOX_IMAGE_DISPLAY_NAME: &str = "tensorlake/ubuntu-minimal";
+
+pub const DEFAULT_SANDBOX_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+const SANDBOX_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Default interval between `GET /sandboxes/{id}` polls while waiting for a
+/// sandbox to run (ADR 0086).
+pub const DEFAULT_SANDBOX_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Message for a sandbox whose wait budget ran out while it was still queued.
+/// The sandbox keeps its place in the queue; nothing here deletes it.
+pub fn format_still_pending_message(
+    sandbox_id: &str,
+    target_status: &str,
+    timeout: Duration,
+    pending_reason: Option<&str>,
+) -> String {
+    let reason = pending_reason
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    format!(
+        "Sandbox {sandbox_id} did not reach '{target_status}' within {}s: still pending{reason}. \
+         It keeps its place in the queue and starts when capacity is available. \
+         Keep waiting with `tl sbx wait {sandbox_id}` or cancel with `tl sbx terminate {sandbox_id}`.",
+        timeout.as_secs(),
+    )
+}
+
+pub fn new_spinner(message: &str) -> indicatif::ProgressBar {
+    let spinner = indicatif::ProgressBar::new_spinner();
+    spinner.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+            .template("{spinner} {msg}")
+            .unwrap(),
+    );
+    spinner.set_message(message.to_string());
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    spinner
+}
+
+/// Poll `GET …/sandboxes/{id}` every [`SANDBOX_WAIT_POLL_INTERVAL`] until
+/// the sandbox reaches `target_status`, settles elsewhere, or `timeout`
+/// elapses. Never deletes the sandbox: a budget that runs out while the
+/// sandbox is still pending reports how to keep waiting (ADR 0086).
+pub async fn wait_for_sandbox_status(
+    ctx: &CliContext,
+    sandbox_id: &str,
+    waiting_message: &str,
+    target_status: &str,
+    timeout: Duration,
+) -> Result<String> {
+    wait_for_sandbox_status_every(
+        ctx,
+        sandbox_id,
+        waiting_message,
+        target_status,
+        timeout,
+        SANDBOX_WAIT_POLL_INTERVAL,
+    )
+    .await
+}
+
+pub async fn wait_for_sandbox_status_every(
+    ctx: &CliContext,
+    sandbox_id: &str,
+    waiting_message: &str,
+    target_status: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<String> {
+    let client = ctx.client()?;
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+
+    let spinner = if is_tty {
+        Some(new_spinner(&format!("{}...", waiting_message)))
+    } else {
+        None
+    };
+
+    let deadline = Instant::now() + timeout;
+    let mut last_pending_reason: Option<String> = None;
+    let mut observed_pending = false;
+    loop {
+        let info_resp = client
+            .get(sandbox_endpoint(ctx, &format!("sandboxes/{sandbox_id}")))
+            .send()
+            .await
+            .map_err(CliError::Http)?;
+
+        if info_resp.status().is_success() {
+            let info: SandboxStatusResponse = info_resp.json().await.map_err(CliError::Http)?;
+            let current_status = info.status;
+
+            if current_status == target_status {
+                if let Some(ref s) = spinner {
+                    s.finish_and_clear();
+                }
+                return Ok(current_status);
+            }
+
+            if current_status == "terminated" && target_status != "terminated" {
+                if let Some(ref s) = spinner {
+                    s.finish_and_clear();
+                }
+                let message = format_sandbox_wait_termination_message(
+                    "Sandbox",
+                    target_status,
+                    &info.failure,
+                );
+                return Err(CliError::Other(anyhow::anyhow!(message)));
+            }
+
+            observed_pending = current_status == "pending";
+            if observed_pending {
+                last_pending_reason = info.pending_reason;
+                if let (Some(s), Some(reason)) = (&spinner, last_pending_reason.as_deref()) {
+                    s.set_message(format!("{waiting_message} ({reason})..."));
+                }
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if let Some(ref s) = spinner {
+                s.finish_and_clear();
+            }
+            if observed_pending && target_status == "running" {
+                return Err(CliError::Other(anyhow::anyhow!(
+                    format_still_pending_message(
+                        sandbox_id,
+                        target_status,
+                        timeout,
+                        last_pending_reason.as_deref(),
+                    )
+                )));
+            }
+            return Err(CliError::Other(anyhow::anyhow!(
+                "Sandbox {} did not reach '{}' within {}s",
+                sandbox_id,
+                target_status,
+                timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(poll_interval.min(remaining)).await;
+    }
+}
+
+pub async fn resolve_sandbox_proxy_target(
+    ctx: &CliContext,
+    identifier: &str,
+) -> Result<ResolvedSandboxProxyTarget> {
+    if is_localhost(&ctx.api_url) {
+        let proxy_url = resolve_default_sandbox_proxy_url(&ctx.api_url);
+        let target = resolve_core_proxy_target(&proxy_url, identifier)?;
+        return Ok(ResolvedSandboxProxyTarget {
+            sandbox_id: identifier.to_string(),
+            proxy_base: target.base_url,
+            host_override: target.host_override,
+            routing_hint: None,
+            ingress_endpoint: None,
+            sandbox_url: None,
+        });
+    }
+
+    let client = ctx.client()?;
+    let resp = client
+        .get(sandbox_endpoint(ctx, &format!("sandboxes/{identifier}")))
+        .send()
+        .await
+        .map_err(CliError::Http)?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CliError::Other(anyhow::anyhow!(
+            "failed to resolve sandbox {} (HTTP {}): {}",
+            identifier,
+            status,
+            body
+        )));
+    }
+
+    let info: serde_json::Value = resp.json().await.map_err(CliError::Http)?;
+    let sandbox_id = info
+        .get("sandbox_id")
+        .or_else(|| info.get("id"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(identifier)
+        .to_string();
+    let routing_hint = info
+        .get("routing_hint")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let ingress_endpoint = info
+        .get("ingress_endpoint")
+        .or_else(|| info.get("ingressEndpoint"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let sandbox_url = info
+        .get("sandbox_url")
+        .or_else(|| info.get("sandboxUrl"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let proxy_url = select_sandbox_proxy_url(
+        &ctx.api_url,
+        &sandbox_id,
+        sandbox_url.as_deref(),
+        ingress_endpoint.as_deref(),
+        explicit_proxy_url_override().as_deref(),
+    )?;
+    let target = resolve_core_proxy_target(&proxy_url, &sandbox_id)?;
+
+    Ok(ResolvedSandboxProxyTarget {
+        sandbox_id,
+        proxy_base: target.base_url,
+        host_override: target.host_override,
+        routing_hint,
+        ingress_endpoint,
+        sandbox_url,
+    })
+}
+
+/// Apply sandbox routing headers to a request builder.
+///
+/// For localhost (host_override is Some): sets the `Host` header.
+/// For cloud (host_override is None): sets `X-Tensorlake-Sandbox-Id`.
+pub fn with_sandbox_headers(
+    req: reqwest::RequestBuilder,
+    target: &ResolvedSandboxProxyTarget,
+) -> reqwest::RequestBuilder {
+    let req = match target.host_override.as_deref() {
+        Some(host) => req.header(reqwest::header::HOST, host),
+        None => req.header("X-Tensorlake-Sandbox-Id", &target.sandbox_id),
+    };
+    if let Some(hint) = target.routing_hint.as_deref() {
+        req.header("X-Tensorlake-Route-Hint", hint)
+    } else {
+        req
+    }
+}
+
+/// Derive the sandbox lifecycle base URL (create/suspend/terminate/...) from the API URL.
+///
+/// Converts `api.tensorlake.*` → `sandbox.tensorlake.*`. Localhost is unchanged.
+pub fn resolve_sandbox_lifecycle_url(api_url: &str) -> String {
+    // Single source of truth, including the TENSORLAKE_SANDBOX_API_URL
+    // override, lives in the cloud SDK crate.
+    tensorlake::resolve_sandbox_lifecycle_url(api_url)
+}
+
+fn explicit_proxy_url_override() -> Option<String> {
+    std::env::var("TENSORLAKE_SANDBOX_PROXY_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn is_localhost(url: &str) -> bool {
+    if let Ok(parsed) = url::Url::parse(url) {
+        let host = parsed.host_str().unwrap_or("");
+        return host == "localhost" || host == "127.0.0.1";
+    }
+    false
+}
+
+fn sandbox_termination_detail(info: &SandboxFailureDetails) -> Option<String> {
+    let reason = info
+        .termination_reason
+        .as_deref()
+        .or(info.reason.as_deref())?;
+    match reason {
+        "ImageNotFound" => Some(
+            info.image
+                .as_deref()
+                .filter(|image| !image.is_empty())
+                .map(|image| format!("image not found: {image}"))
+                .unwrap_or_else(|| "image not found".to_string()),
+        ),
+        _ => Some(format!("termination reason: {reason}")),
+    }
+}
+
+fn error_details_message(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(message) => {
+            let trimmed = message.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().filter_map(error_details_message).collect();
+            if parts.is_empty() {
+                serde_json::to_string(value).ok()
+            } else {
+                Some(parts.join("; "))
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in ["message", "detail", "error", "reason"] {
+                if let Some(serde_json::Value::String(message)) = map.get(key) {
+                    let trimmed = message.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+            serde_json::to_string(value).ok()
+        }
+        _ => Some(value.to_string()),
+    }
+}
+
+fn format_failure_detail(
+    reason: Option<&str>,
+    error_details: Option<&serde_json::Value>,
+) -> Option<String> {
+    let detail = error_details.and_then(error_details_message)?;
+    Some(match reason.filter(|reason| !reason.is_empty()) {
+        Some(reason) => format!("{reason}: {detail}"),
+        None => detail,
+    })
+}
+
+fn sandbox_failure_detail(info: &SandboxFailureDetails) -> Option<String> {
+    format_failure_detail(
+        info.termination_reason
+            .as_deref()
+            .or(info.reason.as_deref()),
+        info.error_details.as_ref(),
+    )
+    .or_else(|| sandbox_termination_detail(info))
+}
+
+fn format_sandbox_wait_termination_message(
+    subject: &str,
+    target_status: &str,
+    info: &SandboxFailureDetails,
+) -> String {
+    if let Some(detail) = sandbox_failure_detail(info) {
+        format!("{subject} failed to reach '{target_status}': {detail}")
+    } else {
+        format!("{subject} terminated while waiting to reach '{target_status}'")
+    }
+}
+
+/// Parse `sandbox_id:/remote/path` syntax.
+pub fn parse_sandbox_path(path: &str) -> (Option<&str>, &str) {
+    if let Some(colon_pos) = path.find(':') {
+        let prefix = &path[..colon_pos];
+        // Avoid matching single-letter drive letters (Windows)
+        if prefix.len() > 1 {
+            return (Some(prefix), &path[colon_pos + 1..]);
+        }
+    }
+    (None, path)
+}
+
+/// Parse KEY=VALUE environment variable pairs.
+pub fn parse_env_vars(env: &[String]) -> Result<Option<serde_json::Value>> {
+    if env.is_empty() {
+        return Ok(None);
+    }
+    let mut map = serde_json::Map::new();
+    for item in env {
+        let eq_pos = item.find('=').ok_or_else(|| {
+            crate::error::CliError::usage(format!("Invalid env format: {}. Use KEY=VALUE.", item))
+        })?;
+        let key = &item[..eq_pos];
+        let value = &item[eq_pos + 1..];
+        map.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    Ok(Some(serde_json::Value::Object(map)))
+}
+
+#[cfg(test)]
+mod sandbox_endpoint_tests {
+    use super::sandbox_endpoint_with;
+
+    #[test]
+    fn cloud_api_url_derives_the_sandbox_host() {
+        assert_eq!(
+            sandbox_endpoint_with(None, "https://api.tensorlake.ai", "ns", "sandboxes"),
+            "https://sandbox.tensorlake.ai/sandboxes"
+        );
+    }
+
+    #[test]
+    fn localhost_api_url_uses_namespaced_paths() {
+        assert_eq!(
+            sandbox_endpoint_with(None, "http://localhost:8900", "ns", "sandboxes/sb_1"),
+            "http://localhost:8900/v1/namespaces/ns/sandboxes/sb_1"
+        );
+    }
+
+    #[test]
+    fn override_wins_in_every_mode_with_flat_paths() {
+        let proxy = Some("https://byoc-acme.tensorlake.ai");
+        assert_eq!(
+            sandbox_endpoint_with(proxy, "https://api.tensorlake.ai", "ns", "sandboxes"),
+            "https://byoc-acme.tensorlake.ai/sandboxes"
+        );
+        // The override is a proxy; the API URL being local does not change
+        // where sandbox requests go or how their paths look.
+        assert_eq!(
+            sandbox_endpoint_with(proxy, "http://localhost:8900", "ns", "sandboxes"),
+            "https://byoc-acme.tensorlake.ai/sandboxes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proxy_access_tests {
+    use super::apply_proxy_access_settings;
+
+    #[test]
+    fn exposed_ports_enable_unauthenticated_access() {
+        let mut body = serde_json::json!({});
+
+        apply_proxy_access_settings(&mut body, &[8000], false);
+
+        assert_eq!(body["exposed_ports"], serde_json::json!([8000]));
+        assert_eq!(
+            body["allow_unauthenticated_access"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn explicit_unauthenticated_access_without_ports_is_preserved() {
+        let mut body = serde_json::json!({});
+
+        apply_proxy_access_settings(&mut body, &[], true);
+
+        assert_eq!(
+            body["allow_unauthenticated_access"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(body.get("exposed_ports").is_none());
+    }
+
+    #[test]
+    fn no_ports_and_no_unauthenticated_access_leave_body_unchanged() {
+        let mut body = serde_json::json!({});
+
+        apply_proxy_access_settings(&mut body, &[], false);
+
+        assert!(body.get("allow_unauthenticated_access").is_none());
+        assert!(body.get("exposed_ports").is_none());
+    }
+}
+
+#[cfg(test)]
+mod network_config_tests {
+    use super::build_network_config;
+
+    #[test]
+    fn no_network_flags_omit_the_policy() {
+        assert_eq!(build_network_config(false, &[], &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn allow_rules_keep_dns_enabled_for_dataplane_allowlist_mode() {
+        let allow = vec!["api.example.com".to_string()];
+        let policy = build_network_config(false, &allow, &[]).unwrap().unwrap();
+
+        assert!(policy.allow_internet_access);
+        assert_eq!(policy.allow_out, allow);
+        assert!(policy.deny_out.is_empty());
+    }
+
+    #[test]
+    fn deny_rules_use_default_allow_mode() {
+        let deny = vec!["ads.example.com".to_string()];
+        let policy = build_network_config(false, &[], &deny).unwrap().unwrap();
+
+        assert!(policy.allow_internet_access);
+        assert!(policy.allow_out.is_empty());
+        assert_eq!(policy.deny_out, deny);
+    }
+
+    #[test]
+    fn no_internet_builds_an_absolute_block_policy() {
+        let policy = build_network_config(true, &[], &[]).unwrap().unwrap();
+
+        assert!(!policy.allow_internet_access);
+        assert!(policy.allow_out.is_empty());
+        assert!(policy.deny_out.is_empty());
+    }
+
+    #[test]
+    fn no_internet_rejects_allow_and_deny_rules() {
+        let rule = vec!["example.com".to_string()];
+
+        assert!(build_network_config(true, &rule, &[]).is_err());
+        assert!(build_network_config(true, &[], &rule).is_err());
+    }
+}
+
+fn format_gpu_allocation(gpus: &[GPUResources]) -> String {
+    if gpus.is_empty() {
+        return "-".to_string();
+    }
+    gpus.iter()
+        .map(|gpu| format!("{} x {}", gpu.count, gpu.model))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn format_created_at(value: Option<&serde_json::Value>) -> String {
+    format_timestamp(created_at_sort_key(value))
+}
+
+fn format_timestamp(timestamp: Option<DateTime<Utc>>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "-".to_string();
+    };
+
+    let now = Utc::now();
+    let age = now.signed_duration_since(timestamp);
+
+    if age < chrono::TimeDelta::zero() || age > chrono::TimeDelta::days(5) {
+        return timestamp
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+    }
+
+    if age < chrono::TimeDelta::minutes(1) {
+        let seconds = age.num_seconds().max(0);
+        return format_relative(seconds, "sec");
+    }
+
+    if age < chrono::TimeDelta::hours(1) {
+        return format_relative(age.num_minutes(), "min");
+    }
+
+    if age < chrono::TimeDelta::days(1) {
+        return format_relative(age.num_hours(), "hr");
+    }
+
+    format_relative(age.num_days(), "day")
+}
+
+fn format_relative(value: i64, unit: &str) -> String {
+    let suffix = if unit == "day" && value != 1 { "s" } else { "" };
+    format!("{value} {unit}{suffix} ago")
+}
+
+pub fn created_at_sort_key(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
+    match value? {
+        serde_json::Value::String(timestamp) => DateTime::parse_from_rfc3339(timestamp)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc)),
+        serde_json::Value::Number(timestamp) => parse_numeric_timestamp(timestamp.as_f64()?),
+        _ => None,
+    }
+}
+
+fn parse_numeric_timestamp(timestamp: f64) -> Option<DateTime<Utc>> {
+    let seconds = if timestamp > 1e15 {
+        timestamp / 1_000_000.0
+    } else if timestamp > 1e12 {
+        timestamp / 1_000.0
+    } else {
+        timestamp
+    };
+
+    let whole_seconds = seconds.trunc() as i64;
+    let nanos = ((seconds.fract() * 1_000_000_000.0).round() as u32).min(999_999_999);
+    Utc.timestamp_opt(whole_seconds, nanos).single()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SandboxFailureDetails, error_details_message, format_created_at,
+        format_sandbox_wait_termination_message, sandbox_termination_detail,
+    };
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn format_created_at_uses_relative_time_for_recent_timestamps() {
+        let timestamp = serde_json::Value::String((Utc::now() - Duration::minutes(3)).to_rfc3339());
+        let formatted = format_created_at(Some(&timestamp));
+
+        assert_eq!(formatted, "3 min ago");
+    }
+
+    #[test]
+    fn format_created_at_uses_absolute_time_after_five_days() {
+        let timestamp = serde_json::Value::String((Utc::now() - Duration::days(6)).to_rfc3339());
+        let formatted = format_created_at(Some(&timestamp));
+
+        assert!(!formatted.ends_with("ago"));
+        assert!(formatted.contains('-'));
+        assert!(formatted.contains(':'));
+    }
+
+    #[test]
+    fn sandbox_termination_detail_formats_image_not_found() {
+        let info = SandboxFailureDetails {
+            termination_reason: Some("ImageNotFound".to_string()),
+            image: Some("foo".to_string()),
+            ..Default::default()
+        };
+
+        let detail = sandbox_termination_detail(&info);
+
+        assert_eq!(detail.as_deref(), Some("image not found: foo"));
+    }
+
+    #[test]
+    fn sandbox_wait_termination_message_includes_image_not_found_detail() {
+        let info = SandboxFailureDetails {
+            termination_reason: Some("ImageNotFound".to_string()),
+            image: Some("foo".to_string()),
+            ..Default::default()
+        };
+
+        let message = format_sandbox_wait_termination_message("Sandbox", "running", &info);
+
+        assert_eq!(
+            message,
+            "Sandbox failed to reach 'running': image not found: foo"
+        );
+    }
+
+    #[test]
+    fn sandbox_wait_termination_message_falls_back_without_reason() {
+        let info = SandboxFailureDetails::default();
+
+        let message = format_sandbox_wait_termination_message("Sandbox", "running", &info);
+
+        assert_eq!(
+            message,
+            "Sandbox terminated while waiting to reach 'running'"
+        );
+    }
+
+    #[test]
+    fn sandbox_wait_termination_message_includes_generic_reason() {
+        let info = SandboxFailureDetails {
+            termination_reason: Some("StartupFailedInternalError".to_string()),
+            ..Default::default()
+        };
+
+        let message = format_sandbox_wait_termination_message("Sandbox", "running", &info);
+
+        assert_eq!(
+            message,
+            "Sandbox failed to reach 'running': termination reason: StartupFailedInternalError"
+        );
+    }
+
+    #[test]
+    fn error_details_message_prefers_message_field() {
+        let details = serde_json::json!({
+            "message": "failed to pull image tensorlake/missing-image",
+            "phase": "pull",
+        });
+
+        let detail = error_details_message(&details);
+
+        assert_eq!(
+            detail.as_deref(),
+            Some("failed to pull image tensorlake/missing-image")
+        );
+    }
+
+    #[test]
+    fn sandbox_wait_termination_message_prefers_error_details() {
+        let info = SandboxFailureDetails {
+            termination_reason: Some("StartupFailedInternalError".to_string()),
+            error_details: Some(serde_json::json!({
+                "message": "failed to pull image tensorlake/missing-image",
+            })),
+            ..Default::default()
+        };
+
+        let message = format_sandbox_wait_termination_message("Sandbox", "running", &info);
+
+        assert_eq!(
+            message,
+            "Sandbox failed to reach 'running': StartupFailedInternalError: failed to pull image tensorlake/missing-image"
+        );
+    }
+}

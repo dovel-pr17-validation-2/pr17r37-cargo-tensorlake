@@ -1,0 +1,95 @@
+[package]
+name = "tensorlake-cli"
+version.workspace = true
+edition = "2024"
+license = "Apache-2.0"
+description = "TensorLake CLI"
+
+[features]
+default = []
+# `tl fs` and `tl git mount`: thin host adapters backed by the private gsvc-fs-client engine.
+# Off by default so this public crate builds with no access to the artifact_storage repo — with the
+# feature off, the resolution placeholder is never compiled.
+# Do NOT build with `--features mount` directly against the placeholder; use `just build-cli-full`,
+# which swaps in the real mount core from a sibling artifact_storage checkout (see that recipe and
+# crates/VENDORED_FROM).
+mount = ["dep:gsvc-fs-client"]
+# `tl git clone`: the fast-clone engine, backed by the private gsvc-codec packfile codec. Same
+# placeholder + ephemeral-vendor arrangement as `mount` (see crates/VENDORED_FROM): off by
+# default so this public crate builds with no access to the artifact_storage repo. Official
+# binaries enable it via `just build-cli-full` locally or the vendor-private-crates CI action.
+# Lives here — not in the published `tensorlake` SDK crate — because crates.io rejects a
+# manifest whose dependency (gsvc-codec) can never be published.
+git-clone = ["dep:gsvc-codec"]
+
+[[bin]]
+name = "tl"
+path = "src/main.rs"
+
+[[bin]]
+name = "tensorlake"
+path = "src/tensorlake.rs"
+
+[dependencies]
+tensorlake = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+comfy-table = { workspace = true }
+indicatif = { workspace = true }
+console = { workspace = true }
+dialoguer = { workspace = true }
+open = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+crossterm = { workspace = true }
+gethostname = { workspace = true }
+tokio-tungstenite = { workspace = true }
+url = { workspace = true }
+urlencoding = { workspace = true }
+futures = { workspace = true }
+bollard = { workspace = true }
+docker-credentials-config = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+minijinja = { workspace = true }
+env-file-reader = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+# Keep the parser's location support while using the permissively licensed bigint backend.
+rustpython-parser = { version = "0.3", default-features = false, features = ["location", "num-bigint"] }
+gsvc-codec = { workspace = true, optional = true }
+gsvc-fs-client = { workspace = true, optional = true }
+uuid = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+sha1 = { workspace = true }
+ignore = { workspace = true }
+rolldown = { workspace = true }
+rolldown_common = { workspace = true }
+tempfile = { workspace = true }
+zip = { workspace = true }
+keyring-core = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
+zbus-secret-service-keyring-store = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { workspace = true }
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }

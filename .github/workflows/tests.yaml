@@ -1,0 +1,326 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - 'main'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    branches:
+      - 'main'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  public_source_checks:
+    name: Public Python source checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: 2.0.0
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Install public dependencies and check formatting
+        run: poetry install --no-root --with=dev && make check
+
+      - name: Run public Python unit tests
+        env:
+          PYTHONPATH: src:tests/applications
+        run: |
+          set -euo pipefail
+          for module in \
+            tests.applications.test_application_manifest \
+            tests.applications.test_code_zip \
+            tests.applications.test_future_validation \
+            tests.applications.test_parse_gitignore \
+            tests.applications.test_request_context_headers \
+            tests.utils.test_retries \
+            tests.sandbox.test_timestamps
+          do
+            poetry run python -m unittest "$module"
+          done
+
+  rust_full_feature_workspace:
+    name: Rust full-feature workspace tests
+    # The customer CLI and native function runners need private source from artifact_storage and
+    # compute-engine-internal. Fork pull requests cannot read either repository-scoped App secret.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest-xlarge
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vendor canonical Function Agent core
+        uses: ./.github/actions/vendor-function-agent-core
+        with:
+          app-id: ${{ secrets.COMPUTE_ENGINE_APP_ID }}
+          private-key: ${{ secrets.COMPUTE_ENGINE_APP_PRIVATE_KEY }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-full-feature
+          cache-bin: false
+
+      - name: Build TypeScript SDK and Function Service runner capsule
+        working-directory: typescript
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+
+      - name: Vendor private artifact_storage crates
+        uses: ./.github/actions/vendor-private-crates
+        with:
+          app-id: ${{ secrets.ARTIFACT_STORAGE_APP_ID }}
+          private-key: ${{ secrets.ARTIFACT_STORAGE_APP_PRIVATE_KEY }}
+
+      - name: Build full-feature CLI
+        run: cargo build -p tensorlake-cli --features mount,git-clone
+
+      - uses: taiki-e/install-action@just
+
+      - name: Enforce HTTP transport policy with customer features
+        run: just lint-http-transports-full
+
+      - name: Test private filesystem client engine
+        run: |
+          CARGO_TARGET_DIR="$PWD/target" cargo clippy --manifest-path crates/gsvc-fs-client/Cargo.toml --all-targets -- -D warnings
+          # Several tests compare live filesystem accounting. Keep them serial so
+          # another test cannot allocate a block between the implementation and
+          # reference statvfs calls.
+          CARGO_TARGET_DIR="$PWD/target" cargo test --manifest-path crates/gsvc-fs-client/Cargo.toml -- --test-threads=1
+
+      - name: Run Rust workspace tests with customer features
+        run: cargo test --workspace --features tensorlake-cli/mount,tensorlake-cli/git-clone
+
+  macos_private_source_contract:
+    name: macOS private client tests
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-macos-private-source
+          cache-bin: false
+
+      - name: Vendor pinned private artifact_storage crates
+        uses: ./.github/actions/vendor-private-crates
+        with:
+          app-id: ${{ secrets.ARTIFACT_STORAGE_APP_ID }}
+          private-key: ${{ secrets.ARTIFACT_STORAGE_APP_PRIVATE_KEY }}
+
+      - name: Run macOS private client unit tests
+        run: >-
+          CARGO_TARGET_DIR="$PWD/target"
+          cargo test --manifest-path crates/gsvc-fs-client/Cargo.toml --lib
+          -- --test-threads=1
+
+  windows_build_smoke:
+    name: Windows build smoke test
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vendor canonical Function Agent core
+        uses: ./.github/actions/vendor-function-agent-core
+        with:
+          app-id: ${{ secrets.COMPUTE_ENGINE_APP_ID }}
+          private-key: ${{ secrets.COMPUTE_ENGINE_APP_PRIVATE_KEY }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build tensorlake wheel
+        uses: PyO3/maturin-action@v1
+        env:
+          CARGO_TARGET_DIR: target
+        with:
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist
+          sccache: 'true'
+
+      - name: Verify wheel imports Rust Cloud SDK extension
+        run: |
+          python .github/scripts/verify_wheel.py "dist/tensorlake-*.whl" tensorlake._cloud_sdk tensorlake.cli.deploy --expect-script function-executor --expect-script tensorlake-python-function-runner --expect-script tensorlake-deploy --reject-script tl --reject-script tensorlake
+
+      - name: Build Node.js native binding
+        env:
+          CARGO_TARGET_DIR: target
+        run: cargo build --release -p tensorlake-rust-cloud-sdk-node --target x86_64-pc-windows-msvc
+
+      - name: Vendor pinned private sources for the Windows CLI
+        uses: ./.github/actions/vendor-private-crates
+        with:
+          app-id: ${{ secrets.ARTIFACT_STORAGE_APP_ID }}
+          private-key: ${{ secrets.ARTIFACT_STORAGE_APP_PRIVATE_KEY }}
+
+      - name: Build Windows CLI with release features
+        run: cargo build --release -p tensorlake-cli --bin tensorlake --target x86_64-pc-windows-msvc --features git-clone
+
+      - name: Verify Windows CLI binary starts
+        run: ./target/x86_64-pc-windows-msvc/release/tensorlake.exe --version
+
+  run_tests:
+    name: Lint and test
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest-xlarge
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vendor canonical Function Agent core
+        uses: ./.github/actions/vendor-function-agent-core
+        with:
+          app-id: ${{ secrets.COMPUTE_ENGINE_APP_ID }}
+          private-key: ${{ secrets.COMPUTE_ENGINE_APP_PRIVATE_KEY }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: "pip"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-no-bin
+          cache-bin: false
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: 2.0.0
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Install, build Rust SDK extension, and lint tensorlake
+        run: poetry install --with=dev && make build_cloud_sdk && make check
+
+      - name: Run sandbox/image SDK unit tests
+        env:
+          PYTHONPATH: src
+        run: |
+          poetry run python -m unittest \
+            tests.sandbox.test_client_rust_backend \
+            tests.sandbox.test_client_rust_backend_async \
+            tests.sandbox.test_sandbox_rust_backend \
+            tests.sandbox.test_sandbox_rust_backend_async \
+            tests.sandbox.test_file_systems \
+            tests.sandbox.test_timestamps \
+            tests.sandbox.test_get_or_create \
+            tests.sandbox.test_gpu_allocations \
+            tests.sandbox.test_pool_gpu \
+            tests.sandbox.test_ready_timeout \
+            tests.sandbox.test_resource_resize \
+            tests.sandbox.test_auto_resume_rust_backend \
+            tests.sandbox.test_auto_resume_transport \
+            tests.image.test_sandbox_builder \
+            tests.image.test_builds \
+            tests.image.test_builds_native \
+            tests.image.test_docker_config_native \
+            tests.function_agent.test_runner \
+            tests.test_usage
+
+  test_sandbox:
+    name: Sandbox integration tests
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vendor canonical Function Agent core
+        uses: ./.github/actions/vendor-function-agent-core
+        with:
+          app-id: ${{ secrets.COMPUTE_ENGINE_APP_ID }}
+          private-key: ${{ secrets.COMPUTE_ENGINE_APP_PRIVATE_KEY }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: "pip"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-no-bin
+          cache-bin: false
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: 2.0.0
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Install Python dependencies
+        run: poetry install --with=dev
+
+      - name: Run Sandbox integration tests
+        run: make test_sandbox
+        env:
+          TENSORLAKE_API_URL: https://api.tensorlake.ai
+          TENSORLAKE_API_KEY: ${{ secrets.TENSORLAKE_API_KEY }}
+          TENSORLAKE_TEST_CLEANUP_GRACE_SECS: "60"

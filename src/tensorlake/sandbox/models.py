@@ -1,0 +1,1254 @@
+"""Pydantic models for sandbox operations."""
+
+import json
+import warnings
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Annotated, Any, Literal, TypeVar
+from urllib.parse import urlparse, urlunparse
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    model_serializer,
+)
+
+from tensorlake._enums import ResponseEnum
+
+_SANDBOX_MANAGEMENT_PORT = 9501
+
+
+def sandbox_url_from_ingress_endpoint(
+    ingress_endpoint: str,
+    sandbox_id: str,
+    port: int | None = None,
+) -> str:
+    """Build a public sandbox URL from a server-provided ingress endpoint.
+
+    ``port`` omitted or ``9501`` returns the sandbox management URL:
+    ``https://<sandbox-id>.<ingress-host>``. User ports use the public
+    ``<port>-<sandbox-id>.<ingress-host>`` form.
+    """
+
+    parsed = urlparse(ingress_endpoint)
+    if parsed.scheme not in ("http", "https") or parsed.hostname is None:
+        raise ValueError("ingress_endpoint must be an absolute http(s) URL")
+
+    label = (
+        sandbox_id
+        if port is None or port == _SANDBOX_MANAGEMENT_PORT
+        else f"{port}-{sandbox_id}"
+    )
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{label}.{host}"
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunparse((parsed.scheme, netloc, "", "", "", ""))
+
+
+def _parse_timestamp(v: int | float | str | datetime | None) -> datetime | str | None:
+    """Convert numeric epochs to UTC datetimes; let Pydantic parse ISO strings.
+
+    Handles seconds, milliseconds, and microseconds by checking magnitude.
+    """
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, str):
+        try:
+            v = float(v)
+        except ValueError:
+            # JSON serialization emits ISO timestamps. Leave those strings to
+            # the datetime validator, which also rejects malformed dates.
+            return v
+    ts = float(v)
+    if ts > 1e15:
+        # Microseconds
+        ts = ts / 1_000_000
+    elif ts > 1e12:
+        # Milliseconds
+        ts = ts / 1_000
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
+OptionalTimestamp = Annotated[datetime | None, BeforeValidator(_parse_timestamp)]
+Timestamp = Annotated[datetime, BeforeValidator(_parse_timestamp)]
+
+
+# What ``Sandbox.get_or_create`` did to bind the name, exposed as
+# ``sandbox.bind_outcome``:
+#
+# - ``"created"``: nothing held the name; the call created a new sandbox.
+# - ``"attached"``: a sandbox already held the name and needed no resume.
+#   Includes a sandbox that was still starting (the call waited for it) and
+#   a suspended sandbox when ``resume=False``.
+# - ``"resumed"``: the sandbox was suspended when the call found it and is
+#   running now.
+GetOrCreateOutcome = Literal["created", "attached", "resumed"]
+
+
+class SandboxStatus(str, Enum):
+    """Status of a sandbox."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SNAPSHOTTING = "snapshotting"
+    SUSPENDING = "suspending"
+    SUSPENDED = "suspended"
+    TERMINATED = "terminated"
+    TIMEOUT = "timeout"
+    # Terminal status used by blocking create/claim responses.
+    FAILED = "failed"
+
+
+class SandboxPendingReason(str, Enum):
+    """Why a pending sandbox is waiting (``pending_reason``).
+
+    The wire value is a snake_case string; unknown future reasons are kept as
+    plain strings on the models, so compare with ``.value`` or the string.
+    """
+
+    SCHEDULING = "scheduling"
+    WAITING_FOR_CONTAINER = "waiting_for_container"
+    NO_EXECUTORS_AVAILABLE = "no_executors_available"
+    NO_RESOURCES_AVAILABLE = "no_resources_available"
+    POOL_AT_CAPACITY = "pool_at_capacity"
+    MAX_CAPACITY_REACHED = "max_capacity_reached"
+    NO_EXECUTOR_FOR_SNAPSHOT_LOCATION = "no_executor_for_snapshot_location"
+    # The autoscaler reported that no fleet can ever place this shape.
+    UNPLACEABLE = "unplaceable"
+
+
+# Terminal ``termination_reason`` values introduced with asynchronous create.
+TERMINATION_REASON_NO_CAPACITY = "no_capacity"
+"""A ``max_pending_secs`` bound expired, or the shape is unplaceable."""
+
+TERMINATION_REASON_CANCELLED = "cancelled"
+"""A pending sandbox was deleted before it ran."""
+
+
+class SnapshotStatus(ResponseEnum):
+    """Status of a snapshot; future server values map to UNKNOWN."""
+
+    IN_PROGRESS = "in_progress"
+    LOCAL_READY = "local_ready"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DELETING = "deleting"
+    REPLICATING = "replicating"
+    UNKNOWN = "unknown"
+
+
+class SnapshotWaitCondition(str, Enum):
+    """Snapshot readiness condition to wait for."""
+
+    LOCAL_READY = "local_ready"
+    COMPLETED = "completed"
+
+
+def snapshot_satisfies_wait_condition(
+    status: SnapshotStatus,
+    wait_until: SnapshotWaitCondition | str,
+) -> bool:
+    """Return whether a snapshot status satisfies the requested wait condition."""
+
+    wait_value = (
+        wait_until.value
+        if isinstance(wait_until, SnapshotWaitCondition)
+        else SnapshotWaitCondition(wait_until).value
+    )
+
+    if wait_value == SnapshotWaitCondition.LOCAL_READY.value:
+        return status in (
+            SnapshotStatus.LOCAL_READY,
+            SnapshotStatus.COMPLETED,
+        )
+    return status == SnapshotStatus.COMPLETED
+
+
+class SnapshotType(str, Enum):
+    """User-facing snapshot type for sandbox snapshot creation.
+
+    - ``MEMORY``: Capture VM memory + filesystem state. Sandboxes
+      restored from this snapshot warm-restore VM memory.
+    - ``FILESYSTEM``: Capture filesystem state only. Sandboxes restored
+      from this snapshot cold-boot from the snapshot tarball instead of
+      warm-restoring VM state. Use this for sandbox image builds so that
+      the restored sandbox bypasses the overlay-path constraints of non-CAS
+      sandboxes.
+    """
+
+    MEMORY = "memory"
+    FILESYSTEM = "filesystem"
+
+
+class CheckpointType(str, Enum):
+    """Checkpoint type for :meth:`Sandbox.checkpoint`.
+
+    - ``MEMORY``: Capture VM memory + filesystem state. Sandboxes
+      restored from this checkpoint warm-restore VM memory and running
+      processes.
+    - ``FILESYSTEM``: Capture filesystem state only. Sandboxes restored
+      from this checkpoint cold-boot from the snapshot tarball.
+    """
+
+    MEMORY = "memory"
+    FILESYSTEM = "filesystem"
+
+
+class GpuModel(str, Enum):
+    """GPU models supported by the sandbox scheduler."""
+
+    A100_40GB = "A100-40GB"
+    A100_80GB = "A100-80GB"
+    H100 = "H100"
+    T4 = "T4"
+    A6000 = "A6000"
+    A10 = "A10"
+    RTX_PRO_6000 = "RTX-PRO-6000"
+    L40 = "L40"
+
+
+class GpuRequest(BaseModel):
+    """A homogeneous GPU allocation for a sandbox."""
+
+    count: int = Field(gt=0)
+    model: GpuModel
+
+
+# Preserve the public name used by request/response models in older releases.
+GPUResources = GpuRequest
+
+
+class GpuAllocation(BaseModel):
+    """A reported GPU allocation, preserving the server's exact model identifier."""
+
+    count: int
+    model: str
+
+
+class ContainerResourcesInfo(BaseModel):
+    """Container resource configuration, including its GPU allocation."""
+
+    cpus: float
+    memory_mb: int
+    disk_mb: int
+    gpu_configs: list[GpuAllocation] | None = Field(
+        default=None, validation_alias=AliasChoices("gpu_configs", "gpus")
+    )
+
+
+class CreateSandboxResources(BaseModel):
+    """Resource overrides accepted when creating a sandbox."""
+
+    cpus: float | None = None
+    memory_mb: int | None = None
+    disk_mb: int | None = None
+    gpus: list[GpuRequest] | None = None
+
+
+class ClearNetworkPolicy(Enum):
+    """Sentinel type for :data:`CLEAR_NETWORK_POLICY`."""
+
+    TOKEN = "clear"
+
+
+CLEAR_NETWORK_POLICY = ClearNetworkPolicy.TOKEN
+"""Pass as ``network`` to ``update_pool`` to remove a pool's network policy.
+
+Omitting ``network`` keeps the pool's current policy, so removing one needs an
+explicit instruction. Containers in the pool become unrestricted.
+"""
+
+
+class NetworkConfig(BaseModel):
+    """Egress network access control policy for a sandbox.
+
+    Enforced host-side per sandbox. ``deny_out`` takes precedence over
+    ``allow_out``: a destination matched by both is blocked. Established and
+    related connections are always permitted (stateful firewall).
+
+    When ``allow_out`` is empty, ``allow_internet_access`` is a simple switch:
+    ``True`` (the default) allows all outbound traffic except ``deny_out``
+    matches; ``False`` blocks all egress, including DNS. A non-empty
+    ``allow_out`` makes the sandbox default-deny in both modes: only the
+    listed destinations are reachable. ``allow_internet_access`` then only
+    controls DNS: ``True`` implicitly allows the sandbox's resolver, so
+    hostname entries work; ``False`` blocks DNS unless the resolver's IP is
+    itself listed in ``allow_out``, so hostname entries need the resolver IP
+    alongside them (or use IP/CIDR entries only).
+
+    Entries may be IPv4 addresses, CIDR ranges, or DNS hostnames (an optional
+    ``:port`` suffix is accepted but does not make the rule port-specific).
+    Hostname rules are followed across DNS changes, so a CDN-backed name keeps
+    working as its addresses rotate. Deny-precedence applies to the sandbox's
+    own DNS resolver too: a ``deny_out`` covering the resolver disables DNS
+    even if ``allow_out`` also covers it.
+
+    The policy can be changed on a running sandbox with
+    :meth:`Sandbox.update` (pass ``network=...`` or
+    :data:`CLEAR_NETWORK_POLICY`).
+    """
+
+    allow_internet_access: bool = True
+    allow_out: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Destinations to allow: IPv4 addresses, CIDRs, or hostnames "
+            '(e.g. ["8.8.8.8", "10.0.0.0/8", "api.example.com"]). '
+            "Overridden by any matching deny_out entry."
+        ),
+    )
+    deny_out: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Destinations to deny: IPv4 addresses, CIDRs, or hostnames "
+            '(e.g. ["192.168.1.0/24", "ads.example.com"]). '
+            "Takes precedence over allow_out."
+        ),
+    )
+
+
+# --- File system models ---
+
+
+class FileSystemMount(BaseModel):
+    """A file system mounted into a sandbox at a guest path.
+
+    ``file_system_id`` is the Artifact Storage file-system name created with
+    ``tl fs create <name>`` and ``mount_path`` is an absolute, unique guest
+    path (e.g. ``/mnt/skills``).
+
+    ``read_only`` mounts the file system read-only; ``prefetch`` eagerly
+    downloads its contents. Both serialize onto the wire only when ``True``:
+    older servers reject mount bodies carrying unknown fields, so ``False``
+    is expressed by omission.
+
+    ``snapshot_id`` pins the mount to a specific filesystem snapshot. A
+    pinned mount must also set ``read_only=True`` (the server rejects a
+    writable pin with HTTP 400). It serializes only when set, for the same
+    compatibility reason as the mount modes.
+
+    ``owner`` presents the mounted files as owned by a guest user: ``NAME``,
+    ``UID``, ``NAME:GROUP``, or ``UID:GID`` (e.g. ``"agent"`` or
+    ``"1001:1001"``), resolved against the sandbox image's own user database
+    when the mount attaches. A named user or group must exist in the image; a
+    bare numeric id is used as-is. Unset means the image default: the baked
+    ``tl-user`` account when the image has one, otherwise root. The mount is
+    reachable by every guest user either way; the owner decides which file
+    modes apply to whom. It serializes only when set, for the same
+    compatibility reason as the mount modes.
+    """
+
+    file_system_id: str
+    mount_path: str
+    read_only: bool = False
+    prefetch: bool = False
+    snapshot_id: str | None = None
+    owner: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_mount_modes(self, handler):
+        data = handler(self)
+        if isinstance(data, dict):
+            if not self.read_only:
+                data.pop("read_only", None)
+            if not self.prefetch:
+                data.pop("prefetch", None)
+            if self.snapshot_id is None:
+                data.pop("snapshot_id", None)
+            if self.owner is None:
+                data.pop("owner", None)
+        return data
+
+
+def _validate_mount_snapshot_pins(mounts: "list[FileSystemMount] | None") -> None:
+    """Client-side mirror of the server's HTTP 400 for invalid snapshot pins.
+
+    A mount that pins ``snapshot_id`` must also be ``read_only``; raising here
+    lets callers fail fast (and offline) instead of round-tripping to the
+    server.
+    """
+    for mount in mounts or []:
+        if mount.snapshot_id is not None and not mount.read_only:
+            raise ValueError(
+                f"file system mount {mount.file_system_id!r} at "
+                f"{mount.mount_path!r} sets snapshot_id without read_only=True: "
+                "snapshot-pinned mounts are read-only"
+            )
+
+
+def _validate_mount_owners(mounts: "list[FileSystemMount] | None") -> None:
+    """Client-side mirror of the server's HTTP 400 for malformed mount owners.
+
+    Only the shape is checked (``NAME``, ``UID``, ``NAME:GROUP``, or
+    ``UID:GID``); a named user or group resolves against the sandbox image's
+    own user database when the mount attaches. Raising here lets callers fail
+    fast (and offline) instead of round-tripping to the server.
+    """
+    for mount in mounts or []:
+        owner = mount.owner
+        if owner is None:
+            continue
+
+        def _reject(reason: str) -> None:
+            raise ValueError(
+                f"file system mount {mount.file_system_id!r} at "
+                f"{mount.mount_path!r} has an invalid owner {owner!r}: {reason}"
+            )
+
+        if not owner or len(owner.encode()) > 256:
+            _reject("owner must contain 1 to 256 bytes")
+        if not all(33 <= ord(ch) <= 126 and ch not in "\"'" for ch in owner):
+            _reject("owner must contain only non-whitespace printable ASCII characters")
+        parts = owner.split(":")
+        if len(parts) > 2 or any(not part for part in parts):
+            _reject("owner must be NAME, UID, NAME:GROUP, or UID:GID")
+        # An all-digit part is unconditionally numeric to the guest resolver,
+        # so an id that does not fit a 32-bit uid/gid can never resolve.
+        for part in parts:
+            if part.isascii() and part.isdigit() and int(part) > 0xFFFFFFFF:
+                _reject("a numeric owner id must fit a 32-bit uid/gid")
+
+
+class FileSystem(BaseModel):
+    """Compatibility view of an Artifact Storage filesystem.
+
+    New code should use :class:`tensorlake.filesystem.FilesystemClient`.
+    Create one with :func:`tensorlake.create_file_system`, then mount it into a sandbox
+    at boot or warm-pool claim (``Sandbox.create(file_systems=[...])``), or
+    attach it to a running sandbox (:meth:`Sandbox.attach_file_system`).
+    """
+
+    id: str | None = None
+    name: str | None = None
+    description: str | None = None
+    region: str | None = None
+    status: str | None = None
+    created_at: str | None = Field(default=None, alias="createdAt")
+    updated_at: str | None = Field(default=None, alias="updatedAt")
+
+    model_config = {"populate_by_name": True}
+
+
+# --- Request models ---
+
+
+class CreateSandboxRequest(BaseModel):
+    """Request payload for creating a sandbox."""
+
+    auto_resume: bool | None = None
+
+    image: str | None = None
+    resources: CreateSandboxResources | None = None
+    timeout_secs: int | None = None
+    entrypoint: list[str] | None = None
+    network: NetworkConfig | None = None
+    snapshot_id: str | None = None
+    allow_unauthenticated_access: bool | None = None
+    exposed_ports: list[int] | None = None
+    name: str | None = None
+    file_systems: list[FileSystemMount] | None = None
+    # ``False`` asks the server to answer as soon as the sandbox is durable
+    # (HTTP 202, ``state: pending``); unset is the blocking create.
+    wait: bool | None = None
+    max_pending_secs: int | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ClaimSandboxRequest(BaseModel):
+    """Sandbox-specific state applied while claiming from a warm pool."""
+
+    file_systems: list[FileSystemMount] | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ResizeStatus(str, Enum):
+    """Status of a live resource resize generation."""
+
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class ResizeErrorReason(str, Enum):
+    """Why a resize failed or its completion could not be observed."""
+
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    SUPERSEDED = "superseded"
+    INTERRUPTED = "interrupted"
+    INCOMPATIBLE_RESPONSE = "incompatible_response"
+
+
+class ResizeSandboxResources(BaseModel):
+    """Partial live resize targets, using the same names and units as create."""
+
+    cpus: float | None = None
+    memory_mb: int | None = None
+    disk_mb: int | None = None
+
+
+class SandboxResourceResizeInfo(BaseModel):
+    """Latest resize generation; SandboxInfo.resources is the confirmed allocation.
+
+    Known statuses use ResizeStatus; future server statuses remain plain strings
+    so the sandbox can still be fetched and inspected.
+    """
+
+    generation: int
+    requested: ContainerResourcesInfo
+    status: ResizeStatus | str = Field(union_mode="left_to_right")
+    error_message: str | None = None
+
+
+class UpdateSandboxRequest(BaseModel):
+    """Request payload for updating a sandbox.
+
+    ``network`` carries only the "set" case here (a policy object). The
+    "keep" and "clear" cases are expressed on the wire by omitting the field
+    or sending an explicit ``null``; the client builds those from the
+    :data:`CLEAR_NETWORK_POLICY` sentinel rather than this model.
+    """
+
+    auto_resume: bool | None = None
+
+    resources: ResizeSandboxResources | None = None
+    name: str | None = None
+    allow_unauthenticated_access: bool | None = None
+    exposed_ports: list[int] | None = None
+    network: NetworkConfig | None = None
+
+
+class SandboxPoolRequest(BaseModel):
+    """Request payload for creating or updating a sandbox pool."""
+
+    image: str
+    resources: CreateSandboxResources
+    timeout_secs: int = 0
+    entrypoint: list[str] | None = None
+    max_containers: int | None = None
+    warm_containers: int | None = None
+    network: NetworkConfig | None = None
+
+
+# --- Response models ---
+
+
+class PendingSandbox(BaseModel):
+    """A sandbox requested with ``wait=False``: the handle returned by
+    ``Sandbox.create(..., wait=False)`` / ``SandboxClient.create(..., wait=False)``.
+
+    The sandbox is durable and starts whenever capacity allows. Collect it
+    with :meth:`ready`, look at it with :meth:`status`, or from any other
+    process with ``Sandbox.connect(sandbox_id)`` (which waits while it is
+    pending) or ``client.list()``. ``pending_reason`` is ``scheduling`` at
+    create time; the capacity reasons appear after the first scheduler pass.
+    A server that predates ``wait=False`` answers the blocking create's
+    shape instead, so ``state`` may already be ``running``.
+    """
+
+    sandbox_id: str
+    name: str | None = None
+    state: SandboxStatus = Field(
+        default=SandboxStatus.PENDING,
+        validation_alias=AliasChoices("state", "status"),
+    )
+    pending_reason: str | None = None
+    routing_hint: str | None = None
+    ingress_endpoint: str | None = None
+    sandbox_url: str | None = None
+    reason: str | None = None
+    termination_reason: str | None = None
+    error_details: Any | None = None
+    trace_id: str | None = Field(default=None, exclude=True)
+
+    # Set by the client that issued the create; see ``_bind``.
+    _client: Any = PrivateAttr(default=None)
+    _proxy_url: str | None = PrivateAttr(default=None)
+    _request_timeout: float | None = PrivateAttr(default=None)
+    _requested_name: str | None = PrivateAttr(default=None)
+    _owns_sandbox: bool = PrivateAttr(default=False)
+
+    model_config = {"populate_by_name": True}
+
+    def _bind(
+        self,
+        client: Any,
+        *,
+        proxy_url: str | None,
+        request_timeout: float | None,
+        requested_name: str | None,
+        owns_sandbox: bool,
+    ) -> "PendingSandbox":
+        self._client = client
+        self._proxy_url = proxy_url
+        self._request_timeout = request_timeout
+        self._requested_name = requested_name
+        self._owns_sandbox = owns_sandbox
+        return self
+
+    def _require_client(self) -> Any:
+        if self._client is None:
+            raise RuntimeError(
+                "PendingSandbox is not bound to a client; use the handle returned "
+                "by create(wait=False)"
+            )
+        return self._client
+
+    def status(self) -> "SandboxInfo":
+        """Fetch the sandbox's current state with one ``GET``."""
+        return self._require_client().get(self.sandbox_id).value
+
+    def ready(
+        self,
+        timeout: float | None = None,
+        *,
+        poll_interval: float = 2.0,
+        cancel_on_timeout: bool = False,
+    ) -> "Any":
+        """Wait for the sandbox to be running and return a connected ``Sandbox``.
+
+        Polls ``GET /sandboxes/{id}`` every ``poll_interval`` seconds. Call it
+        again after a ``SandboxPending`` to keep waiting.
+
+        Args:
+            timeout: Seconds to wait; defaults to the client request timeout.
+                ``0`` observes the current state once.
+            poll_interval: Seconds between polls (default 2).
+            cancel_on_timeout: Delete the sandbox when ``timeout`` runs out
+                while it is still pending, then raise ``SandboxError``
+                (the pre-ADR-0086 behaviour). Default False.
+
+        Raises:
+            SandboxPending: ``timeout`` elapsed while the sandbox was still
+                pending. It keeps its place in the queue; the exception
+                carries ``sandbox_id`` and ``pending_reason``.
+            SandboxError: The sandbox settled somewhere else: ``terminated``
+                or ``failed`` (``reason`` is the server's, such as
+                ``no_capacity`` or ``cancelled``), or ``suspended``.
+        """
+        client = self._require_client()
+        budget = client._request_timeout if timeout is None else timeout
+        observed = client._wait_for_sandbox(self.sandbox_id, budget, poll_interval)
+        return client._settle_wait(
+            observed,
+            budget=budget,
+            proxy_url=self._proxy_url,
+            request_timeout=self._request_timeout,
+            cancel_on_timeout=cancel_on_timeout,
+            requested_name=self._requested_name,
+            owns_sandbox=self._owns_sandbox,
+            trace_id=self.trace_id,
+        )
+
+
+class AsyncPendingSandbox(PendingSandbox):
+    """Async mirror of :class:`PendingSandbox`: the handle returned by
+    ``AsyncSandbox.create(..., wait=False)`` /
+    ``AsyncSandboxClient.create(..., wait=False)``."""
+
+    async def status(self) -> "SandboxInfo":  # type: ignore[override]
+        """Fetch the sandbox's current state with one ``GET``."""
+        return (await self._require_client().get(self.sandbox_id)).value
+
+    async def ready(  # type: ignore[override]
+        self,
+        timeout: float | None = None,
+        *,
+        poll_interval: float = 2.0,
+        cancel_on_timeout: bool = False,
+    ) -> "Any":
+        """Wait for the sandbox to be running and return a connected
+        ``AsyncSandbox``; see :meth:`PendingSandbox.ready`."""
+        client = self._require_client()
+        budget = client._request_timeout if timeout is None else timeout
+        observed = await client._wait_for_sandbox(
+            self.sandbox_id, budget, poll_interval
+        )
+        return await client._settle_wait(
+            observed,
+            budget=budget,
+            proxy_url=self._proxy_url,
+            request_timeout=self._request_timeout,
+            cancel_on_timeout=cancel_on_timeout,
+            requested_name=self._requested_name,
+            owns_sandbox=self._owns_sandbox,
+            trace_id=self.trace_id,
+        )
+
+
+class CreateSandboxResponse(BaseModel):
+    """Response from a blocking create or a pool claim.
+
+    The server waits for readiness for at most the request timeout and can
+    already report ``running``; a ``pending`` answer carries a
+    ``pending_reason``. Use ``connect(sandbox_id)`` to wait for a pending
+    sandbox, or ``create(..., wait=False)`` for a :class:`PendingSandbox`.
+    """
+
+    sandbox_id: str
+    status: SandboxStatus = Field(validation_alias=AliasChoices("status", "state"))
+    reason: str | None = None
+    routing_hint: str | None = None
+    ingress_endpoint: str | None = None
+    sandbox_url: str | None = None
+    name: str | None = None
+    termination_reason: str | None = None
+    error_details: Any | None = None
+    pending_reason: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class CopiedSandboxResponse(BaseModel):
+    """One sandbox returned by a live sandbox copy request.
+
+    Partial copy responses can include failed sandboxes, so ``status`` is kept
+    as a raw server string instead of the normal ``SandboxStatus`` enum.
+    """
+
+    sandbox_id: str
+    status: str
+    reason: str | None = None
+    routing_hint: str | None = None
+    ingress_endpoint: str | None = None
+    sandbox_url: str | None = None
+    name: str | None = None
+    termination_reason: str | None = None
+    error_details: Any | None = None
+
+
+class CopySandboxResponse(BaseModel):
+    """Response from live-copying a running sandbox."""
+
+    source_sandbox_id: str
+    sandboxes: list[CopiedSandboxResponse]
+
+
+class SandboxInfo(BaseModel):
+    """Full sandbox information."""
+
+    auto_resume: bool = True
+
+    sandbox_id: str = Field(alias="id")
+    namespace: str
+    status: SandboxStatus
+    image: str | None = None
+    runtime: str | None = Field(
+        default=None,
+        description=(
+            "The runtime the server chose for this sandbox: 'firecracker', "
+            "'cloud-hypervisor' or 'gvisor'. Informational only; it is never "
+            "sent and is 'firecracker' when the server recorded none."
+        ),
+    )
+    resource_resize: SandboxResourceResizeInfo | None = None
+    resources: ContainerResourcesInfo
+    timeout_secs: int | None = None
+    entrypoint: list[str] | None = None
+    network_policy: NetworkConfig | None = Field(
+        default=None,
+        description="Egress network policy currently applied to the sandbox.",
+    )
+    pool_id: str | None = None
+    outcome: str | None = None
+    termination_reason: str | None = None
+    error_details: Any | None = None
+    pending_reason: str | None = None
+    created_at: OptionalTimestamp = None
+    terminated_at: OptionalTimestamp = None
+    name: str | None = None
+    allow_unauthenticated_access: bool = False
+    exposed_ports: list[int] | None = None
+    ingress_endpoint: str | None = None
+    sandbox_url: str | None = None
+    routing_hint: str | None = None
+    file_systems: list[FileSystemMount] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+    @property
+    def network(self) -> NetworkConfig | None:
+        """Deprecated alias for :attr:`network_policy`."""
+
+        warnings.warn(
+            "SandboxInfo.network is deprecated; use SandboxInfo.network_policy",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.network_policy
+
+    def url_for_port(self, port: int = _SANDBOX_MANAGEMENT_PORT) -> str | None:
+        """Return the public URL for the management API or an exposed user port."""
+
+        if port == _SANDBOX_MANAGEMENT_PORT:
+            return self.sandbox_url
+        if self.ingress_endpoint is not None:
+            return sandbox_url_from_ingress_endpoint(
+                self.ingress_endpoint,
+                self.sandbox_id,
+                port,
+            )
+        return None
+
+
+class SandboxPortAccess(BaseModel):
+    """Current proxy access configuration for a sandbox."""
+
+    allow_unauthenticated_access: bool = False
+    exposed_ports: list[int] = Field(default_factory=list)
+    ingress_endpoint: str | None = None
+    sandbox_url: str | None = None
+
+
+class ListSandboxesResponse(BaseModel):
+    """Response from listing sandboxes (internal use)."""
+
+    sandboxes: list[SandboxInfo]
+
+
+class ArchivedSandboxInfo(SandboxInfo):
+    """A terminated sandbox parked in the server's archived sandboxes store.
+
+    Inherits every field from :class:`SandboxInfo` and adds the archival
+    timestamp.
+    """
+
+    archived_at: Timestamp
+
+
+class ListArchivedSandboxesResponse(BaseModel):
+    """Response from listing archived sandboxes (internal use)."""
+
+    sandboxes: list[ArchivedSandboxInfo]
+    prev_cursor: str | None = None
+    next_cursor: str | None = None
+
+
+class CreateSandboxPoolResponse(BaseModel):
+    """Response from creating a sandbox pool."""
+
+    pool_id: str
+    namespace: str
+
+
+class ContainerState(str, Enum):
+    """State of a container in a pool."""
+
+    IDLE = "Idle"
+    RUNNING = "Running"
+
+
+class PoolContainerInfo(BaseModel):
+    """Information about a container in a sandbox pool."""
+
+    id: str
+    state: str
+    sandbox_id: str | None = None
+    executor_id: str
+
+
+class SandboxPoolInfo(BaseModel):
+    """Full sandbox pool information.
+
+    When retrieved via ``get_pool``, the ``containers`` field is populated
+    with the list of containers in the pool. It is ``None`` when returned
+    from ``list_pools`` or ``update_pool``.
+    """
+
+    pool_id: str = Field(alias="id")
+    namespace: str
+    image: str
+    resources: ContainerResourcesInfo
+    timeout_secs: int = 0
+    entrypoint: list[str] | None = None
+    max_containers: int | None = None
+    warm_containers: int | None = None
+    network_policy: NetworkConfig | None = None
+    containers: list[PoolContainerInfo] | None = None
+    created_at: OptionalTimestamp = None
+    updated_at: OptionalTimestamp = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ListSandboxPoolsResponse(BaseModel):
+    """Response from listing sandbox pools (internal use)."""
+
+    pools: list[SandboxPoolInfo]
+
+
+# --- Snapshot models ---
+
+SnapshotResponseT = TypeVar("SnapshotResponseT", bound="_SnapshotResponse")
+
+
+class _SnapshotResponse(BaseModel):
+    status: SnapshotStatus
+    raw: dict[str, Any] = Field(default_factory=dict, repr=False, exclude=True)
+
+    @classmethod
+    def from_response(
+        cls: type[SnapshotResponseT], payload: dict | str
+    ) -> SnapshotResponseT:
+        raw = json.loads(payload) if isinstance(payload, str) else payload
+        if not isinstance(raw, dict):
+            raise ValueError("snapshot response must be a JSON object")
+        if raw.get("status") is None:
+            raise ValueError("snapshot response must include status")
+        return cls.model_validate(
+            {
+                **raw,
+                "status": SnapshotStatus.from_response(raw["status"]),
+                "raw": dict(raw),
+            }
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not type(other):
+            return NotImplemented
+        return all(
+            getattr(self, name) == getattr(other, name)
+            for name in type(self).model_fields
+            if name != "raw"
+        )
+
+
+class CreateSnapshotResponse(_SnapshotResponse):
+    """Response from creating a snapshot."""
+
+    snapshot_id: str
+
+
+class SnapshotInfo(_SnapshotResponse):
+    """Full snapshot information."""
+
+    snapshot_id: str = Field(alias="id")
+    namespace: str
+    sandbox_id: str
+    base_image: str | None = None
+    snapshot_type: SnapshotType | None = None
+    error: str | None = None
+    snapshot_uri: str | None = None
+    snapshot_format_version: str | None = None
+    size_bytes: int | None = None
+    rootfs_disk_bytes: int | None = None
+    created_at: OptionalTimestamp = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ListSnapshotsResponse(BaseModel):
+    """Response from listing snapshots (internal use)."""
+
+    snapshots: list[SnapshotInfo] = Field(default_factory=list)
+
+    @classmethod
+    def from_response(cls, payload: dict | str) -> "ListSnapshotsResponse":
+        raw = json.loads(payload) if isinstance(payload, str) else payload
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise ValueError("snapshot response must contain a snapshots list")
+        snapshots = raw.get("snapshots")
+        if snapshots is None:
+            snapshots = []
+        if not isinstance(snapshots, list):
+            raise ValueError("snapshot response must contain a snapshots list")
+        return cls(snapshots=[SnapshotInfo.from_response(item) for item in snapshots])
+
+
+class SandboxLogLevel(str, Enum):
+    """Log severity filter for persisted sandbox logs."""
+
+    TRACE = "trace"
+    DEBUG = "debug"
+    INFO = "info"
+    WARN = "warn"
+    ERROR = "error"
+    FATAL = "fatal"
+
+
+class SandboxLogSignal(BaseModel):
+    """A persisted sandbox log record."""
+
+    timestamp: int
+    uuid: str
+    namespace: str
+    application: str = ""
+    sandbox_id: str | None = Field(default=None, alias="sandboxId")
+    resource_attributes: list[tuple[str, str]] = Field(
+        default_factory=list, alias="resourceAttributes"
+    )
+    body: str
+    log_attributes: str = Field(alias="logAttributes")
+    allocations: list[str] = Field(default_factory=list)
+    function_runs: list[str] = Field(default_factory=list, alias="functionRuns")
+    level: int | None = None
+    retention: int | None = None
+
+
+class SandboxLogsResponse(BaseModel):
+    """Response from reading persisted sandbox logs."""
+
+    logs: list[SandboxLogSignal]
+    next_token: str | None = Field(default=None, alias="nextToken")
+
+
+class SandboxProcessLogFilter(BaseModel):
+    """Process metadata available as a persisted-log filter."""
+
+    process_id: str = Field(alias="processId")
+    process_pid: str = Field(alias="processPid")
+    process_command: str = Field(alias="processCommand")
+    process_managed_id: str = Field(alias="processManagedId")
+    process_managed_name: str = Field(alias="processManagedName")
+    first_seen: int = Field(alias="firstSeen")
+    last_seen: int = Field(alias="lastSeen")
+    log_count: int = Field(alias="logCount")
+
+
+class SandboxProcessLogFiltersResponse(BaseModel):
+    """Response from listing sandbox process log filters."""
+
+    processes: list[SandboxProcessLogFilter]
+
+
+# --- Container daemon models (process management, file ops, I/O) ---
+
+
+class ProcessStatus(str, Enum):
+    """Status of a process running in a sandbox."""
+
+    RUNNING = "running"
+    EXITED = "exited"
+    SIGNALED = "signaled"
+    OOM_KILLED = "oom_killed"
+
+
+class StdinMode(str, Enum):
+    """Stdin mode for a process."""
+
+    CLOSED = "closed"
+    PIPE = "pipe"
+
+
+class OutputMode(str, Enum):
+    """Output capture mode for stdout/stderr."""
+
+    CAPTURE = "capture"
+    DISCARD = "discard"
+
+
+class ProcessUserSpec(BaseModel):
+    """Structured POSIX user identity for process execution inside a sandbox."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    uid: int | None = None
+    gid: int | None = None
+
+
+ProcessUser = str | ProcessUserSpec | dict[str, str | int | None]
+
+
+class RestartPolicy(str, Enum):
+    """Restart behavior for a managed sandbox process."""
+
+    NEVER = "never"
+    ON_FAILURE = "on_failure"
+    ALWAYS = "always"
+
+
+class RestartPolicyConfig(BaseModel):
+    """Restart policy and backoff settings for a managed process."""
+
+    policy: RestartPolicy = RestartPolicy.ON_FAILURE
+    max_restarts: int | None = None
+    initial_backoff_ms: int = 500
+    max_backoff_ms: int = 30_000
+
+
+class ProcessHealthCheckType(str, Enum):
+    """Managed-process health check type."""
+
+    HTTP = "http"
+    TCP = "tcp"
+
+
+class ProcessHealthCheck(BaseModel):
+    """Local health check for a managed process."""
+
+    type: ProcessHealthCheckType
+    port: int
+    path: str | None = None
+    initial_delay_ms: int = 5_000
+    interval_ms: int = 1_000
+    timeout_ms: int = 500
+    failure_threshold: int = 3
+
+
+class ManagedProcessStatus(str, Enum):
+    """Supervisor lifecycle status for a managed process."""
+
+    STARTING = "starting"
+    RUNNING = "running"
+    BACKING_OFF = "backing_off"
+    STOPPED = "stopped"
+
+
+class ManagedProcessHealthStatus(str, Enum):
+    """Latest managed-process health status."""
+
+    DISABLED = "disabled"
+    STARTING = "starting"
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+
+
+class ManagedProcessExit(BaseModel):
+    """Terminal status of a previous managed process run."""
+
+    exit_code: int | None = None
+    signal: int | None = None
+    oom_killed: bool = False
+    ended_at: Timestamp
+
+
+class ManagedProcessInfo(BaseModel):
+    """Managed-process metadata embedded into ProcessInfo.
+
+    A managed process is addressable by either its current PID or, if a ``name`` was given
+    at creation, that name (process APIs accept a PID or process name). ``id`` is a stable
+    daemon-local identifier: it equals ``name`` when one was set, otherwise a daemon-assigned
+    opaque id (the process is then addressable only by PID, not by ``id``).
+    """
+
+    id: str
+    name: str | None = None
+    status: ManagedProcessStatus
+    restart_count: int
+    restart: RestartPolicyConfig
+    health_check: ProcessHealthCheck | None = None
+    health_status: ManagedProcessHealthStatus
+    consecutive_health_failures: int
+    last_exit: ManagedProcessExit | None = None
+    last_error: str | None = None
+    next_restart_at: OptionalTimestamp = None
+
+
+class ProcessInfo(BaseModel):
+    """Information about a process running in a sandbox."""
+
+    handle: int | None = None
+    pid: int
+    status: ProcessStatus
+    exit_code: int | None = None
+    signal: int | None = None
+    stdin_writable: bool = False
+    command: str
+    args: list[str] = Field(default_factory=list)
+    started_at: Timestamp
+    ended_at: OptionalTimestamp = None
+    managed: ManagedProcessInfo | None = None
+
+
+class ListProcessesResponse(BaseModel):
+    """Response from listing processes (internal use)."""
+
+    processes: list[ProcessInfo]
+
+
+class SendSignalResponse(BaseModel):
+    """Response from sending a signal to a process."""
+
+    success: bool
+
+
+class OutputResponse(BaseModel):
+    """Response containing process output lines."""
+
+    pid: int
+    lines: list[str]
+    line_count: int
+
+
+class OutputEvent(BaseModel):
+    """A single output event from an SSE stream."""
+
+    line: str
+    timestamp: Timestamp
+    stream: str | None = None
+
+
+class DaemonInfo(BaseModel):
+    """Information about the container daemon."""
+
+    version: str
+    uptime_secs: int
+    running_processes: int
+    total_processes: int
+
+
+class HealthResponse(BaseModel):
+    """Health check response from the container daemon."""
+
+    healthy: bool
+
+
+class DirectoryEntry(BaseModel):
+    """An entry in a directory listing."""
+
+    name: str
+    is_dir: bool
+    size: int | None = None
+    modified_at: OptionalTimestamp = None
+
+
+class ListDirectoryResponse(BaseModel):
+    """Response from listing a directory in a sandbox."""
+
+    path: str
+    entries: list[DirectoryEntry]
+
+
+class CommandExitReason(str, Enum):
+    """Why a command run with ``Sandbox.run`` ended."""
+
+    EXITED = "exited"
+    """The process exited on its own; ``exit_code`` is its exit status."""
+    SIGNALED = "signaled"
+    """The process was killed by a signal; ``exit_code`` is ``-signal``."""
+    OOM_KILLED = "oom_killed"
+    """The kernel OOM killer terminated the process (``exit_code`` is ``-9``)."""
+    TIMED_OUT = "timed_out"
+    """The run's ``timeout`` expired and the sandbox killed the process
+    (``exit_code`` is ``-9``)."""
+
+
+class CommandResult(BaseModel):
+    """Result of running a command to completion."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+    reason: CommandExitReason | None = None
+    """Why the command ended. ``Sandbox.run`` always sets it; sandboxes that
+    predate timeout reporting never report ``TIMED_OUT``, so a timed-out run
+    on them shows as ``SIGNALED``."""
+
+    @property
+    def timed_out(self) -> bool:
+        """True when the run's ``timeout`` expired and the process was killed."""
+        return self.reason == CommandExitReason.TIMED_OUT

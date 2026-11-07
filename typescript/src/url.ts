@@ -1,0 +1,153 @@
+import * as defaults from "./defaults.js";
+
+/** Remove a trailing slash from a URL string if present. */
+function trimTrailingSlashes(url: string): string {
+  return url.endsWith("/") ? url.slice(0, -1) : url;
+}
+
+/** Check whether a URL points to localhost. */
+export function isLocalhost(apiUrl: string): boolean {
+  try {
+    const parsed = new URL(apiUrl);
+    return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+  } catch {
+    return false;
+  }
+}
+
+/** Return the explicit sandbox proxy env override, if the user set one. */
+export function explicitProxyUrlOverride(): string | undefined {
+  const explicit = process.env.TENSORLAKE_SANDBOX_PROXY_URL?.trim();
+  return explicit && explicit.length > 0 ? explicit : undefined;
+}
+
+/**
+ * Resolve the legacy default proxy URL for direct sandbox handles.
+ *
+ * Normal client connect/create flows use the server-returned `sandboxUrl`.
+ * This helper keeps the old direct-handle behavior and treats the env var as
+ * an explicit override.
+ *
+ * Legacy priority:
+ * 1. TENSORLAKE_SANDBOX_PROXY_URL env var
+ * 2. `http://localhost:9443` for localhost API URLs
+ * 3. Transform `api.X` → `sandbox.X`
+ * 4. Default fallback
+ */
+export function resolveProxyUrl(apiUrl: string): string {
+  const explicit = explicitProxyUrlOverride();
+  if (explicit) return explicit;
+
+  if (isLocalhost(apiUrl)) return "http://localhost:9443";
+
+  try {
+    const parsed = new URL(apiUrl);
+    const host = parsed.hostname;
+    if (host.startsWith("api.")) {
+      const proxyHost = "sandbox." + host.slice(4);
+      return `${parsed.protocol}//${proxyHost}`;
+    }
+  } catch {
+    // fall through to default
+  }
+
+  return defaults.SANDBOX_PROXY_URL;
+}
+
+/**
+ * Resolve the proxy target for a specific sandbox.
+ *
+ * - Localhost: base URL stays the same, Host header set to `{sandboxId}.local`
+ * - Cloud: selected proxy domain with `X-Tensorlake-Sandbox-Id` header
+ *
+ * Returns `{ baseUrl, hostHeader, sandboxIdHeader }`.
+ */
+export function resolveProxyTarget(
+  proxyUrl: string,
+  sandboxId: string,
+): { baseUrl: string; hostHeader: string | undefined; sandboxIdHeader: string | undefined } {
+  try {
+    const parsed = new URL(proxyUrl);
+    const host = parsed.hostname;
+
+    if (host === "localhost" || host === "127.0.0.1") {
+      return {
+        baseUrl: trimTrailingSlashes(proxyUrl),
+        hostHeader: `${sandboxId}.local`,
+        sandboxIdHeader: undefined,
+      };
+    }
+
+    const port = parsed.port ? `:${parsed.port}` : "";
+    return {
+      baseUrl: `${parsed.protocol}//${host}${port}`,
+      hostHeader: undefined,
+      sandboxIdHeader: sandboxId,
+    };
+  } catch {
+    return {
+      baseUrl: `${trimTrailingSlashes(proxyUrl)}/${sandboxId}`,
+      hostHeader: undefined,
+      sandboxIdHeader: undefined,
+    };
+  }
+}
+
+/**
+ * Build a public sandbox URL from a server-provided ingress endpoint.
+ *
+ * `port` omitted or `9501` returns the management URL:
+ * `https://<sandbox-id>.<ingress-host>`. User ports use the public
+ * `<port>-<sandbox-id>.<ingress-host>` form.
+ */
+export function sandboxUrlFromIngressEndpoint(
+  ingressEndpoint: string,
+  sandboxId: string,
+  port = 9501,
+): string {
+  const parsed = new URL(ingressEndpoint);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("ingressEndpoint must be an absolute http(s) URL");
+  }
+  const label = port === 9501 ? sandboxId : `${port}-${sandboxId}`;
+  return `${parsed.protocol}//${label}.${parsed.host}`;
+}
+
+/**
+ * Derive the sandbox lifecycle URL from the API URL.
+ *
+ * Transforms `api.X` → `sandbox.X` for cloud. Returns the URL unchanged for
+ * localhost or unrecognised patterns.
+ */
+export function resolveSandboxLifecycleUrl(apiUrl: string): string {
+  if (isLocalhost(apiUrl)) return apiUrl;
+
+  try {
+    const parsed = new URL(apiUrl);
+    if (parsed.hostname.startsWith("api.")) {
+      parsed.hostname = "sandbox." + parsed.hostname.slice(4);
+      return parsed.toString().replace(/\/$/, "");
+    }
+  } catch {
+    // fall through
+  }
+
+  return apiUrl;
+}
+
+/**
+ * Build a lifecycle API path.
+ *
+ * - Localhost (namespaced): `/v1/namespaces/{namespace}/{path}`
+ * - Cloud (flat): `/{path}`
+ */
+export function lifecyclePath(
+  path: string,
+  isLocal: boolean,
+  namespace: string,
+): string {
+  if (isLocal) {
+    return `/v1/namespaces/${namespace}/${path}`;
+  }
+  return `/${path}`;
+}

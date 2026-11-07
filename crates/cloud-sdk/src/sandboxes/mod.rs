@@ -1,0 +1,1921 @@
+pub mod desktop;
+pub mod models;
+pub mod resize;
+pub mod tunnel;
+
+use futures::{StreamExt, TryStreamExt};
+use reqwest::Method;
+use reqwest::StatusCode;
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, HeaderValue};
+use serde_json::Value;
+use std::path::Path;
+use std::time::{Duration, Instant};
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
+
+use crate::{
+    client::{
+        Client, REQUEST_TIMEOUT_GRACE_HEADER, Traced, build_bytes_post_request_from_builder,
+        build_empty_post_request_from_builder,
+    },
+    error::{SdkError, TransportFailure},
+    retry::{RetryDecision, RetryPolicy, RetryState, is_transient},
+    sse::event_stream,
+};
+pub use desktop::SandboxDesktopClient;
+
+/// Default interval between `GET /sandboxes/{id}` polls while waiting for a
+/// sandbox to run (ADR 0086).
+pub const DEFAULT_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Terminal reason a pending sandbox is given when its `max_pending_secs`
+/// bound expires.
+pub const TERMINATION_REASON_NO_CAPACITY: &str = "no_capacity";
+
+/// Terminal reason of a pending sandbox that was deleted before it ran.
+pub const TERMINATION_REASON_CANCELLED: &str = "cancelled";
+
+/// Transient failures (502/503/504, a cut connection, a timed-out poll)
+/// tolerated per wait loop between two successful observations. Each
+/// observation resets the count, so a wait that spans a control-plane
+/// rollout keeps going. A pending sandbox is not routable yet, so the
+/// lifecycle gateway can answer a transient proxy error until it starts.
+const WAIT_TRANSIENT_RETRIES: usize = 10;
+
+/// Most of the request timeout a server-side wait
+/// ([`SandboxesClient::create_and_wait`], [`SandboxesClient::suspend_and_wait`],
+/// [`SandboxesClient::resume_and_wait`]) leaves for the server's answer, so
+/// it reaches the client before the client's own deadline. A quarter of
+/// shorter timeouts is used instead.
+const WAIT_RESPONSE_GRACE: Duration = Duration::from_secs(5);
+
+/// Longest wait the Sandbox Engine holds a suspend or resume request open.
+const LIFECYCLE_WAIT_CAP: Duration = Duration::from_secs(30);
+/// Most pages a listing follows. Each page after the first asks for
+/// `LIST_PAGE_LIMIT` items, so this bounds a listing at about 100,000.
+const MAX_LIST_PAGES: usize = 1000;
+/// Items each page after the first asks for: the Sandbox Engine's maximum.
+const LIST_PAGE_LIMIT: &str = "100";
+
+/// A listing the server may answer in pages: its items, and where the next
+/// page starts.
+trait ListingPage: serde::de::DeserializeOwned {
+    type Item;
+    fn into_page(self) -> (Vec<Self::Item>, Option<String>);
+}
+
+impl ListingPage for ListSandboxesResponse {
+    type Item = SandboxInfo;
+    fn into_page(self) -> (Vec<SandboxInfo>, Option<String>) {
+        (self.sandboxes, self.cursor)
+    }
+}
+
+impl ListingPage for ListSnapshotsResponse {
+    type Item = SnapshotInfo;
+    fn into_page(self) -> (Vec<SnapshotInfo>, Option<String>) {
+        (self.snapshots, self.cursor)
+    }
+}
+
+/// Whether a sandbox `status` is one a readiness wait keeps polling through.
+pub fn is_sandbox_pending(status: &str) -> bool {
+    status == "pending"
+}
+
+/// Smallest HTTP timeout given to the first readiness poll of a wait, so a
+/// wait with almost no budget can still observe the state once. Later polls
+/// are capped at the remaining budget exactly: when it runs out the last
+/// observation is returned instead of waiting for a slow answer.
+pub const WAIT_POLL_MIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+use models::{
+    ArchivedSandboxInfo, ArchivedSandboxesPaginationDirection, ClaimSandboxRequest,
+    CopySandboxResponse, CreateSandboxPoolRequest, CreateSandboxPoolResponse, CreateSandboxRequest,
+    CreateSandboxResponse, CreateSnapshotRequest, CreateSnapshotResponse, DaemonInfo,
+    DetachFileSystemRequest, FileSystemMount, GetSandboxLogsRequest, HealthResponse,
+    ListArchivedSandboxesParams, ListArchivedSandboxesResponse, ListDirectoryResponse,
+    ListProcessesResponse, ListSandboxPoolsResponse, ListSandboxesResponse, ListSnapshotsResponse,
+    NetworkPolicyUpdate, OutputEvent, OutputResponse, ProcessInfo, RunProcessEvent,
+    SandboxAccepted, SandboxInfo, SandboxLogsResponse, SandboxPoolInfo, SandboxPoolRequest,
+    SandboxProcessLogFiltersResponse, SendSignalResponse, SignBlobRequest, SnapshotInfo,
+    SnapshotType, UpdateSandboxPoolRequest, UpdateSandboxRequest,
+};
+
+pub const DEFAULT_SANDBOX_PROXY_URL: &str = "https://sandbox.tensorlake.ai";
+pub const SANDBOX_MANAGEMENT_PORT: u16 = 9501;
+
+/// Wire-only response for claim-time configuration negotiation. Keep the
+/// acknowledgement private so adding the protocol field does not make the
+/// existing public [`CreateSandboxResponse`] source-incompatible for Rust
+/// callers that construct it directly.
+#[derive(Debug, serde::Deserialize)]
+struct ClaimSandboxResponse {
+    #[serde(flatten)]
+    sandbox: CreateSandboxResponse,
+    #[serde(default)]
+    claim_configuration_applied: Option<bool>,
+}
+
+/// Client-side mirror of the server's HTTP 400 for invalid snapshot pins:
+/// a mount that pins `snapshot_id` must also be `read_only`, so callers fail
+/// fast (and offline) instead of round-tripping to the server.
+fn validate_mount_snapshot_pins(mounts: &[FileSystemMount]) -> Result<(), SdkError> {
+    for mount in mounts {
+        if mount.snapshot_id.is_some() && !mount.read_only {
+            return Err(SdkError::ClientError(format!(
+                "file system mount {:?} at {:?} sets snapshot_id without read_only: \
+                 snapshot-pinned mounts are read-only",
+                mount.file_system_id, mount.mount_path
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Client-side mirror of the server's HTTP 400 for malformed mount owner
+/// specs (`NAME`, `UID`, `NAME:GROUP`, or `UID:GID`), so callers fail fast
+/// (and offline) instead of round-tripping to the server. Only the shape is
+/// checked — a named user or group resolves against the sandbox image's own
+/// user database when the mount attaches.
+fn validate_mount_owners(mounts: &[FileSystemMount]) -> Result<(), SdkError> {
+    const MAX_MOUNT_OWNER_BYTES: usize = 256;
+    for mount in mounts {
+        let Some(owner) = mount.owner.as_deref() else {
+            continue;
+        };
+        let reject = |reason: &str| {
+            Err(SdkError::ClientError(format!(
+                "file system mount {:?} at {:?} has an invalid owner {owner:?}: {reason}",
+                mount.file_system_id, mount.mount_path
+            )))
+        };
+        if owner.is_empty() || owner.len() > MAX_MOUNT_OWNER_BYTES {
+            return reject("owner must contain 1 to 256 bytes");
+        }
+        if !owner
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\'')
+        {
+            return reject("owner must contain only non-whitespace printable ASCII characters");
+        }
+        let parts = owner.split(':').collect::<Vec<_>>();
+        if parts.len() > 2 || parts.iter().any(|part| part.is_empty()) {
+            return reject("owner must be NAME, UID, NAME:GROUP, or UID:GID");
+        }
+        // An all-digit part is unconditionally numeric to the guest resolver,
+        // so a u32 overflow can never resolve.
+        for part in parts {
+            if part.bytes().all(|byte| byte.is_ascii_digit()) && part.parse::<u32>().is_err() {
+                return reject("a numeric owner id must fit a 32-bit uid/gid");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A reference to a sandbox process: either its OS **pid** or a managed-process **name**
+/// given at creation. This is the single place the pid/name path segment is built, reused by
+/// the Rust SDK, the Python/Node bindings, and the CLI.
+#[derive(Debug, Clone)]
+pub enum ProcessRef {
+    Pid(u64),
+    Name(String),
+}
+
+impl ProcessRef {
+    /// The `{pid_or_name}` path segment. A pid is a bare decimal; a name is **percent-encoded**
+    /// so arbitrary characters (spaces, punctuation) survive as a single path segment. `/`
+    /// can't appear in a valid name (see [`validate_managed_name`]), so encoded slashes never
+    /// arise. The daemon's `Path<String>` extractor percent-decodes before matching the name.
+    pub fn to_path_segment(&self) -> String {
+        match self {
+            ProcessRef::Pid(pid) => pid.to_string(),
+            ProcessRef::Name(name) => urlencoding::encode(name).into_owned(),
+        }
+    }
+}
+
+impl From<u64> for ProcessRef {
+    fn from(pid: u64) -> Self {
+        ProcessRef::Pid(pid)
+    }
+}
+impl From<u32> for ProcessRef {
+    fn from(pid: u32) -> Self {
+        ProcessRef::Pid(pid as u64)
+    }
+}
+impl From<i64> for ProcessRef {
+    fn from(pid: i64) -> Self {
+        ProcessRef::Pid(pid as u64)
+    }
+}
+impl From<&str> for ProcessRef {
+    fn from(s: &str) -> Self {
+        // An all-ASCII-digit string is a pid; anything else is a managed name. This mirrors
+        // the daemon's route disambiguation, so a stringified pid still hits the pid branch.
+        if !s.is_empty()
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(pid) = s.parse::<u64>()
+        {
+            return ProcessRef::Pid(pid);
+        }
+        ProcessRef::Name(s.to_string())
+    }
+}
+impl From<String> for ProcessRef {
+    fn from(s: String) -> Self {
+        ProcessRef::from(s.as_str())
+    }
+}
+impl From<&String> for ProcessRef {
+    fn from(s: &String) -> Self {
+        ProcessRef::from(s.as_str())
+    }
+}
+
+/// Validate a user-supplied managed-process name. **Single source of truth** for the rule
+/// across the Rust SDK, the Python/Node bindings, and the CLI (the daemon keeps a
+/// byte-identical copy in its own repo). Permissive on purpose -- a name may contain any
+/// characters (spaces, punctuation, unicode; clients percent-encode the path segment) with
+/// only three rejections:
+///   1. empty (no path segment),
+///   2. contains `/` (an encoded slash is unreliable across the proxy/router chain), and
+///   3. all ASCII digits (reserved for PID addressing on the shared `/processes/{pid_or_name}`
+///      route -- this is the one residual backward-incompatibility; see release notes).
+pub fn validate_managed_name(name: &str) -> Result<(), SdkError> {
+    if name.is_empty() {
+        return Err(SdkError::ClientError(
+            "managed process name must not be empty".to_string(),
+        ));
+    }
+    if name.contains('/') {
+        return Err(SdkError::ClientError(
+            "managed process name must not contain '/'".to_string(),
+        ));
+    }
+    if name.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(SdkError::ClientError(
+            "managed process name must not be all digits; numeric strings are reserved for PID addressing"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxProxyTarget {
+    pub base_url: String,
+    pub host_override: Option<String>,
+    pub sandbox_id_header: Option<String>,
+}
+
+pub fn sandbox_url_from_ingress_endpoint(
+    ingress_endpoint: &str,
+    sandbox_id: &str,
+    port: Option<u16>,
+) -> Result<String, SdkError> {
+    let parsed = reqwest::Url::parse(ingress_endpoint).map_err(|error| {
+        SdkError::ClientError(format!(
+            "invalid ingress endpoint `{ingress_endpoint}`: {error}"
+        ))
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(SdkError::ClientError(
+            "ingress_endpoint must be an absolute http(s) URL".to_string(),
+        ));
+    }
+    let host = parsed.host_str().ok_or_else(|| {
+        SdkError::ClientError(format!(
+            "ingress endpoint `{ingress_endpoint}` is missing a host"
+        ))
+    })?;
+    let label = match port {
+        Some(port) if port != SANDBOX_MANAGEMENT_PORT => format!("{port}-{sandbox_id}"),
+        _ => sandbox_id.to_string(),
+    };
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let port_part = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+    Ok(format!("{}://{label}.{host}{port_part}", parsed.scheme()))
+}
+
+pub fn resolve_default_sandbox_proxy_url(api_url: &str) -> String {
+    if let Ok(url) = std::env::var("TENSORLAKE_SANDBOX_PROXY_URL") {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if is_localhost_api_url(api_url) {
+        return "http://localhost:9443".to_string();
+    }
+    if let Ok(parsed) = reqwest::Url::parse(api_url)
+        && let Some(host) = parsed.host_str()
+        && let Some(rest) = host.strip_prefix("api.")
+    {
+        return format!("{}://sandbox.{rest}", parsed.scheme());
+    }
+    DEFAULT_SANDBOX_PROXY_URL.to_string()
+}
+
+pub fn select_sandbox_proxy_url(
+    _api_url: &str,
+    _sandbox_id: &str,
+    server_sandbox_url: Option<&str>,
+    _server_ingress_endpoint: Option<&str>,
+    explicit_proxy_url: Option<&str>,
+) -> Result<String, SdkError> {
+    if let Some(url) = non_empty(server_sandbox_url) {
+        return Ok(url.to_string());
+    }
+    if let Some(url) = non_empty(explicit_proxy_url) {
+        return Ok(url.to_string());
+    }
+    Err(SdkError::ClientError(
+        "server response did not include sandbox_url; refusing to derive a proxy URL".to_string(),
+    ))
+}
+
+pub fn resolve_sandbox_proxy_target(
+    proxy_url: &str,
+    sandbox_id: &str,
+) -> Result<SandboxProxyTarget, SdkError> {
+    let parsed = reqwest::Url::parse(proxy_url).map_err(|error| {
+        SdkError::ClientError(format!("invalid proxy url `{proxy_url}`: {error}"))
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        SdkError::ClientError(format!("proxy url `{proxy_url}` is missing a host"))
+    })?;
+
+    if host == "localhost" || host == "127.0.0.1" {
+        return Ok(SandboxProxyTarget {
+            base_url: proxy_url.trim_end_matches('/').to_string(),
+            host_override: Some(format!("{sandbox_id}.local")),
+            sandbox_id_header: None,
+        });
+    }
+
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+    Ok(SandboxProxyTarget {
+        base_url: format!("{}://{host}{port}", parsed.scheme()),
+        host_override: None,
+        sandbox_id_header: Some(sandbox_id.to_string()),
+    })
+}
+
+pub fn sandbox_proxy_hostname(proxy_url: &str) -> Result<String, SdkError> {
+    let parsed = reqwest::Url::parse(proxy_url).map_err(|error| {
+        SdkError::ClientError(format!("invalid sandbox url `{proxy_url}`: {error}"))
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(SdkError::ClientError(
+            "sandbox_url must be an absolute http(s) URL".to_string(),
+        ));
+    }
+    parsed.host_str().map(str::to_string).ok_or_else(|| {
+        SdkError::ClientError(format!("sandbox url `{proxy_url}` is missing a host"))
+    })
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn is_localhost_api_url(api_url: &str) -> bool {
+    reqwest::Url::parse(api_url)
+        .ok()
+        .and_then(|url| url.host_str().map(ToString::to_string))
+        .is_some_and(|host| host == "localhost" || host == "127.0.0.1")
+}
+
+/// A client for managing sandbox lifecycle, pool, and snapshot APIs.
+#[derive(Clone)]
+pub struct SandboxesClient {
+    client: Client,
+    log_client: Client,
+    namespace: String,
+    use_namespaced_endpoints: bool,
+}
+
+impl SandboxesClient {
+    /// Create a new sandboxes client.
+    ///
+    /// If `use_namespaced_endpoints` is true, requests are sent to
+    /// `/v1/namespaces/{namespace}/...`; otherwise to `/{endpoint}`.
+    pub fn new(
+        client: Client,
+        namespace: impl Into<String>,
+        use_namespaced_endpoints: bool,
+    ) -> Self {
+        Self {
+            log_client: client.clone(),
+            client,
+            namespace: namespace.into(),
+            use_namespaced_endpoints,
+        }
+    }
+
+    /// Use a separate client/base URL for log-reader endpoints.
+    pub fn with_log_client(mut self, log_client: Client) -> Self {
+        self.log_client = log_client;
+        self
+    }
+
+    pub fn http_client(&self) -> &Client {
+        &self.client
+    }
+
+    fn endpoint(&self, endpoint: &str) -> String {
+        if self.use_namespaced_endpoints {
+            format!("/v1/namespaces/{}/{}", self.namespace, endpoint)
+        } else {
+            format!("/{endpoint}")
+        }
+    }
+
+    fn log_endpoint(&self, endpoint: &str) -> String {
+        format!("/v1/namespaces/{}/{}", self.namespace, endpoint)
+    }
+
+    /// Blocking create: the server waits for readiness for at most the
+    /// client's request timeout and answers `status: timeout` (HTTP 504)
+    /// when it runs out, leaving the sandbox pending. A startup failure is an
+    /// HTTP 422 error; [`Self::create_and_wait`] returns it as a record.
+    pub async fn create(
+        &self,
+        request: &CreateSandboxRequest,
+    ) -> Result<Traced<CreateSandboxResponse>, SdkError> {
+        validate_mount_snapshot_pins(&request.file_systems)?;
+        validate_mount_owners(&request.file_systems)?;
+        let uri = self.endpoint("sandboxes");
+        let req = self
+            .client
+            .build_post_json_request(Method::POST, &uri, request)?;
+        self.client
+            .execute_json_allow_status(req, &[StatusCode::GATEWAY_TIMEOUT])
+            .await
+    }
+
+    /// Blocking create for create-and-connect. The server waits on its own
+    /// state changes and answers as soon as the sandbox runs (`running`),
+    /// fails before running (`failed`, HTTP 422) or the wait runs out
+    /// (`timeout`, HTTP 504, the sandbox stays queued). Every answer is a
+    /// record carrying the sandbox id. The grace header makes the server
+    /// answer before this client's own request timeout.
+    pub async fn create_and_wait(
+        &self,
+        request: &CreateSandboxRequest,
+    ) -> Result<Traced<CreateSandboxResponse>, SdkError> {
+        validate_mount_snapshot_pins(&request.file_systems)?;
+        validate_mount_owners(&request.file_systems)?;
+        let uri = self.endpoint("sandboxes");
+        let mut req = self
+            .client
+            .build_post_json_request(Method::POST, &uri, request)?;
+        if let Some(timeout) = self.client.request_timeout() {
+            let grace = WAIT_RESPONSE_GRACE.min(timeout / 4);
+            req.headers_mut().insert(
+                REQUEST_TIMEOUT_GRACE_HEADER,
+                HeaderValue::from(grace.as_millis() as u64),
+            );
+        }
+        self.client
+            .execute_json_allow_status(
+                req,
+                &[
+                    StatusCode::GATEWAY_TIMEOUT,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                ],
+            )
+            .await
+    }
+
+    /// Wait-free create (ADR 0086): sends `request` with `wait: false` and
+    /// returns the acknowledgement (HTTP 202) as soon as the sandbox is
+    /// durable. The sandbox starts whenever capacity allows; wait for it with
+    /// [`Self::wait_until_settled`] or poll [`Self::get`] / [`Self::list`].
+    ///
+    /// The call is not idempotent: a retry that the server did receive
+    /// creates a second sandbox. Callers that must not duplicate give the
+    /// sandbox a `name` (unique per namespace; a repeat is a 409) and resolve
+    /// it with get-or-create, and wrap this only in
+    /// [`crate::retry::RetryPolicy::non_idempotent`].
+    pub async fn create_no_wait(
+        &self,
+        request: &CreateSandboxRequest,
+    ) -> Result<Traced<SandboxAccepted>, SdkError> {
+        validate_mount_snapshot_pins(&request.file_systems)?;
+        validate_mount_owners(&request.file_systems)?;
+        let request = CreateSandboxRequest {
+            wait: Some(false),
+            ..request.clone()
+        };
+        let uri = self.endpoint("sandboxes");
+        let req = self
+            .client
+            .build_post_json_request(Method::POST, &uri, &request)?;
+        // A server that predates `wait: false` blocks and may answer its
+        // legacy `status: timeout` 504; the sandbox is pending either way.
+        self.client
+            .execute_json_allow_status(req, &[StatusCode::GATEWAY_TIMEOUT])
+            .await
+    }
+
+    /// Poll [`Self::get`] every `poll_interval` until the sandbox leaves
+    /// `pending` or `timeout` elapses, and return the last observation.
+    ///
+    /// Never deletes the sandbox and never treats a timeout as an error: a
+    /// `pending` status in the result means the caller's budget ran out
+    /// while the sandbox kept its place in the queue, and it is the caller's
+    /// decision to keep waiting, cancel, or raise. Any other status
+    /// (`running`, `suspended`, `terminated`, ...) ends the wait. A zero
+    /// `timeout` observes the state once without sleeping. Transient
+    /// failures (502/503/504, a cut connection, a timed-out poll) are
+    /// retried up to [`WAIT_TRANSIENT_RETRIES`] times between observations;
+    /// a missing sandbox surfaces as the poll's 404.
+    ///
+    /// The budget is honoured closely: it is checked before every poll and
+    /// every sleep, no sleep runs past the deadline, each poll's HTTP timeout
+    /// is capped at the remaining budget (only the very first attempt gets
+    /// [`WAIT_POLL_MIN_REQUEST_TIMEOUT`], so the state can be observed once),
+    /// and once the budget is spent the last observation is returned without
+    /// another request. When nothing was observed before the budget ran out
+    /// (the first attempts all failed), the last error is returned instead.
+    pub async fn wait_until_settled(
+        &self,
+        sandbox_id: &str,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<Traced<SandboxInfo>, SdkError> {
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut last: Option<Traced<SandboxInfo>> = None;
+        let mut last_error: Option<SdkError> = None;
+        let mut last_progress = started;
+        let mut retry = RetryState::new(RetryPolicy::idempotent(WAIT_TRANSIENT_RETRIES));
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if let Some(last) = last {
+                    return Ok(last);
+                }
+                if let Some(error) = last_error {
+                    return Err(error);
+                }
+            }
+            // Only the very first attempt is allowed the floor; after a
+            // failed attempt every retry is capped at what is left.
+            let per_poll = if last.is_none() && last_error.is_none() {
+                remaining.max(WAIT_POLL_MIN_REQUEST_TIMEOUT)
+            } else {
+                remaining
+            };
+            match self.get_within(sandbox_id, per_poll).await {
+                Ok(info) => {
+                    if !is_sandbox_pending(&info.status) {
+                        return Ok(info);
+                    }
+                    last = Some(info);
+                    last_progress = Instant::now();
+                    retry = RetryState::new(RetryPolicy::idempotent(WAIT_TRANSIENT_RETRIES));
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(last.expect("observed"));
+                    }
+                    tokio::time::sleep(poll_interval.min(remaining)).await;
+                }
+                Err(error) => {
+                    let cut_short = is_transient(&error)
+                        || error.transport_failure() == Some(TransportFailure::Timeout);
+                    match retry.decide_with_transient(&error, last_progress.elapsed(), cut_short) {
+                        RetryDecision::Retry(wait) => {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                return match last {
+                                    Some(last) => Ok(last),
+                                    None => Err(error),
+                                };
+                            }
+                            tokio::time::sleep(wait.min(remaining)).await;
+                            last_error = Some(error);
+                        }
+                        RetryDecision::Stop => return Err(error),
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn claim(&self, pool_id: &str) -> Result<Traced<CreateSandboxResponse>, SdkError> {
+        let uri = self.endpoint(&format!("sandbox-pools/{pool_id}/sandboxes"));
+        let req = self.client.build_empty_post_request(&uri)?;
+        self.client
+            .execute_json_allow_status(req, &[StatusCode::GATEWAY_TIMEOUT])
+            .await
+    }
+
+    /// Claim a sandbox from a pool and apply sandbox-specific file-system
+    /// mounts before the claimed sandbox becomes ready. Fails closed when the
+    /// server does not acknowledge claim-configuration support and requests
+    /// termination of the incorrectly configured sandbox returned by that
+    /// server.
+    pub async fn claim_with_request(
+        &self,
+        pool_id: &str,
+        request: &ClaimSandboxRequest,
+    ) -> Result<Traced<CreateSandboxResponse>, SdkError> {
+        validate_mount_snapshot_pins(&request.file_systems)?;
+        validate_mount_owners(&request.file_systems)?;
+        let uri = self.endpoint(&format!("sandbox-pools/{pool_id}/sandboxes"));
+        let req = self
+            .client
+            .build_post_json_request(Method::POST, &uri, request)?;
+        let response: Traced<ClaimSandboxResponse> = self
+            .client
+            .execute_json_allow_status(req, &[StatusCode::GATEWAY_TIMEOUT])
+            .await?;
+        let claim_configuration_applied = response.claim_configuration_applied;
+        let response = response.map(|response| response.sandbox);
+        if claim_configuration_applied != Some(true) {
+            let cleanup = match self.delete(&response.sandbox_id).await {
+                Ok(_) => format!(
+                    "termination was requested for sandbox {:?}",
+                    response.sandbox_id
+                ),
+                Err(error) => format!(
+                    "cleanup of sandbox {:?} also failed: {error}",
+                    response.sandbox_id
+                ),
+            };
+            return Err(SdkError::ClientError(format!(
+                "server did not acknowledge sandbox pool claim configuration for pool \
+                 {pool_id:?}; upgrade the compute-engine server before requesting claim-time \
+                 file systems; {cleanup}"
+            )));
+        }
+        Ok(response)
+    }
+
+    pub async fn copy(
+        &self,
+        sandbox_id: &str,
+        times: usize,
+    ) -> Result<Traced<CopySandboxResponse>, SdkError> {
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}/copy"));
+        let req = build_empty_post_request_from_builder(
+            self.client
+                .request(Method::POST, &uri)
+                .query(&[("times", times)]),
+        )?;
+        self.client
+            .execute_json_allow_status(
+                req,
+                &[
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    StatusCode::GATEWAY_TIMEOUT,
+                ],
+            )
+            .await
+    }
+
+    pub async fn get(&self, sandbox_id: &str) -> Result<Traced<SandboxInfo>, SdkError> {
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}"));
+        let req = self.client.request(Method::GET, &uri).build()?;
+        self.client.execute_read_json(req).await
+    }
+
+    /// [`Self::get`] with the HTTP timeout set to `timeout` (never above the
+    /// client's own timeout), so a readiness poll cannot outlive the wait it
+    /// serves.
+    async fn get_within(
+        &self,
+        sandbox_id: &str,
+        timeout: Duration,
+    ) -> Result<Traced<SandboxInfo>, SdkError> {
+        let timeout = match self.client.request_timeout() {
+            Some(client_timeout) => timeout.min(client_timeout),
+            None => timeout,
+        };
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}"));
+        let req = self
+            .client
+            .request(Method::GET, &uri)
+            .timeout(timeout)
+            .build()?;
+        self.client.execute_read_json_once(req).await
+    }
+
+    /// Every sandbox in the namespace, following the listing's cursor to its
+    /// end.
+    pub async fn list(&self) -> Result<Traced<Vec<SandboxInfo>>, SdkError> {
+        let uri = self.endpoint("sandboxes");
+        self.list_all::<ListSandboxesResponse>(&uri, MAX_LIST_PAGES)
+            .await
+    }
+
+    /// Every item of a listing, following its cursor until a page has none.
+    /// The first request carries no query, so a server that answers in one
+    /// response (the Indexify Server) gets exactly one request; later pages
+    /// ask for `LIST_PAGE_LIMIT` items. The trace id is the first page's.
+    async fn list_all<P: ListingPage>(
+        &self,
+        uri: &str,
+        max_pages: usize,
+    ) -> Result<Traced<Vec<P::Item>>, SdkError> {
+        let mut trace_id = None;
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..max_pages {
+            let mut request = self.client.request(Method::GET, uri);
+            if let Some(cursor) = cursor.as_deref() {
+                request = request.query(&[("cursor", cursor), ("limit", LIST_PAGE_LIMIT)]);
+            }
+            let page = self.client.execute_read_json::<P>(request.build()?).await?;
+            trace_id.get_or_insert_with(|| page.trace_id.clone());
+            let (page_items, next) = page.into_inner().into_page();
+            items.extend(page_items);
+            match next.filter(|next| !next.is_empty()) {
+                // A cursor seen before would revisit pages it already returned.
+                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
+                Some(next) => {
+                    return Err(SdkError::ClientError(format!(
+                        "listing {uri} returned cursor {next} a second time"
+                    )));
+                }
+                None => return Ok(Traced::new(trace_id.unwrap_or_default(), items)),
+            }
+        }
+        Err(SdkError::ClientError(format!(
+            "listing {uri} did not end within {max_pages} pages"
+        )))
+    }
+
+    /// List archived (terminated) sandboxes in the namespace. Archived sandboxes
+    /// live in their own column family until the server-configured TTL expires.
+    pub async fn list_archived(
+        &self,
+        params: &ListArchivedSandboxesParams,
+    ) -> Result<Traced<ListArchivedSandboxesResponse>, SdkError> {
+        let uri = self.endpoint("archived-sandboxes");
+        let mut request_builder = self.client.request(Method::GET, &uri);
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = params.limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(cursor) = params.cursor.as_deref() {
+            query.push(("cursor", cursor.to_string()));
+        }
+        if let Some(direction) = params.direction {
+            let value = match direction {
+                ArchivedSandboxesPaginationDirection::Forward => "forward",
+                ArchivedSandboxesPaginationDirection::Backward => "backward",
+            };
+            query.push(("direction", value.to_string()));
+        }
+        if !query.is_empty() {
+            request_builder = request_builder.query(&query);
+        }
+        let req = request_builder.build()?;
+        self.client.execute_read_json(req).await
+    }
+
+    pub async fn get_archived(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Traced<ArchivedSandboxInfo>, SdkError> {
+        let uri = self.endpoint(&format!("archived-sandboxes/{sandbox_id}"));
+        let req = self.client.request(Method::GET, &uri).build()?;
+        self.client.execute_read_json(req).await
+    }
+
+    pub async fn get_logs(
+        &self,
+        request: &GetSandboxLogsRequest,
+    ) -> Result<Traced<SandboxLogsResponse>, SdkError> {
+        let uri = self.log_endpoint(&format!("sandboxes/{}/logs", request.sandbox_id));
+        let mut req_builder = self.log_client.request(Method::GET, &uri);
+
+        for level in &request.levels {
+            req_builder = req_builder.query(&[("level", level.as_i8())]);
+        }
+        for process_id in &request.process_ids {
+            req_builder = req_builder.query(&[("processId", process_id)]);
+        }
+        if let Some(ref param_value) = request.next_token {
+            req_builder = req_builder.query(&[("nextToken", param_value)]);
+        }
+        if let Some(param_value) = request.head {
+            req_builder = req_builder.query(&[("head", param_value)]);
+        }
+        if let Some(param_value) = request.tail {
+            req_builder = req_builder.query(&[("tail", param_value)]);
+        }
+        if let Some(ref param_value) = request.body {
+            req_builder = req_builder.query(&[("body", param_value)]);
+        }
+
+        let req = req_builder.build()?;
+        self.log_client.execute_json(req).await
+    }
+
+    pub async fn list_log_processes(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Traced<SandboxProcessLogFiltersResponse>, SdkError> {
+        let uri = self.log_endpoint(&format!("sandboxes/{sandbox_id}/processes"));
+        let req = self.log_client.request(Method::GET, &uri).build()?;
+        self.log_client.execute_json(req).await
+    }
+
+    /// Update sandbox settings, or perform a standalone live resource resize.
+    /// Resource updates wait up to 300 seconds for the admitted generation.
+    /// Use `update_with_options` to return admission or change the wait budget.
+    pub async fn update(
+        &self,
+        sandbox_id: &str,
+        request: &UpdateSandboxRequest,
+    ) -> Result<Traced<SandboxInfo>, SdkError> {
+        self.update_with_options(sandbox_id, request, resize::ResizeOptions::default())
+            .await
+    }
+
+    pub async fn delete(&self, sandbox_id: &str) -> Result<Traced<()>, SdkError> {
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}"));
+        let req = self.client.request(Method::DELETE, &uri).build()?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn suspend(&self, sandbox_id: &str) -> Result<Traced<()>, SdkError> {
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}/suspend"));
+        let req = self.client.build_empty_post_request(&uri)?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn resume(&self, sandbox_id: &str) -> Result<Traced<()>, SdkError> {
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}/resume"));
+        let req = self.client.build_empty_post_request(&uri)?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    /// Suspend that waits on the server for up to `wait`. Returns `true` when
+    /// the server answers that the sandbox is suspended (HTTP 200) and
+    /// `false` when the wait ran out first (HTTP 202, the suspend continues).
+    /// A failed or superseded suspend is an HTTP 409 error. A server without
+    /// the wait answers 202 at once.
+    pub async fn suspend_and_wait(
+        &self,
+        sandbox_id: &str,
+        wait: Duration,
+    ) -> Result<Traced<bool>, SdkError> {
+        self.lifecycle_and_wait(sandbox_id, "suspend", wait).await
+    }
+
+    /// Resume that waits on the server for up to `wait`. Returns `true` when
+    /// the server answers that the sandbox is running (HTTP 200) and `false`
+    /// when the wait ran out first (HTTP 202, the resume continues). A failed
+    /// or superseded resume is an HTTP 409 error. A server without the wait
+    /// answers 202 at once.
+    pub async fn resume_and_wait(
+        &self,
+        sandbox_id: &str,
+        wait: Duration,
+    ) -> Result<Traced<bool>, SdkError> {
+        self.lifecycle_and_wait(sandbox_id, "resume", wait).await
+    }
+
+    async fn lifecycle_and_wait(
+        &self,
+        sandbox_id: &str,
+        action: &str,
+        wait: Duration,
+    ) -> Result<Traced<bool>, SdkError> {
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}/{action}"));
+        let wait_ms = self.lifecycle_wait(wait).as_millis().to_string();
+        let req = build_empty_post_request_from_builder(
+            self.client
+                .request(Method::POST, &uri)
+                .query(&[("wait_ms", wait_ms)]),
+        )?;
+        Ok(self
+            .client
+            .execute_traced(req)
+            .await?
+            .map(|response| response.status() == StatusCode::OK))
+    }
+
+    /// The server-side wait for a lifecycle request: at most `wait`, the
+    /// server's own cap, and the request timeout less a response grace.
+    fn lifecycle_wait(&self, wait: Duration) -> Duration {
+        let wait = wait.min(LIFECYCLE_WAIT_CAP);
+        match self.client.request_timeout() {
+            Some(timeout) => wait.min(timeout.saturating_sub(WAIT_RESPONSE_GRACE.min(timeout / 4))),
+            None => wait,
+        }
+    }
+
+    /// Attach a registered file system to a running sandbox at `mount_path`.
+    ///
+    /// The mount completes asynchronously on the dataplane; the returned
+    /// [`SandboxInfo`] already reflects the new entry in `file_systems`.
+    ///
+    /// `read_only` and `prefetch` select optional mount modes; they are sent
+    /// on the wire only when `true` so older servers (which reject unknown
+    /// fields) keep accepting attach bodies.
+    ///
+    /// `snapshot_id` pins the mount to a specific filesystem snapshot and
+    /// requires `read_only`; it is sent only when set for the same
+    /// compatibility reason.
+    ///
+    /// `owner` presents the mounted files as owned by a guest user spec
+    /// (`NAME`, `UID`, `NAME:GROUP`, or `UID:GID`), resolved against the
+    /// sandbox image's own user database at attach time; unset keeps the
+    /// image default. It is sent only when set for the same compatibility
+    /// reason.
+    pub async fn attach_file_system(
+        &self,
+        sandbox_id: &str,
+        file_system_id: &str,
+        mount_path: &str,
+        read_only: bool,
+        prefetch: bool,
+        snapshot_id: Option<&str>,
+        owner: Option<&str>,
+    ) -> Result<Traced<SandboxInfo>, SdkError> {
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}/file_systems"));
+        let body = FileSystemMount {
+            file_system_id: file_system_id.to_string(),
+            mount_path: mount_path.to_string(),
+            read_only,
+            prefetch,
+            snapshot_id: snapshot_id.map(str::to_string),
+            owner: owner.map(str::to_string),
+        };
+        validate_mount_snapshot_pins(std::slice::from_ref(&body))?;
+        validate_mount_owners(std::slice::from_ref(&body))?;
+        let req = self
+            .client
+            .build_post_json_request(Method::POST, &uri, &body)?;
+        self.client.execute_json(req).await
+    }
+
+    /// Detach the file system mounted at `mount_path` from a running sandbox.
+    ///
+    /// The unmount completes asynchronously on the dataplane; the returned
+    /// [`SandboxInfo`] already reflects the removed `file_systems` entry.
+    pub async fn detach_file_system(
+        &self,
+        sandbox_id: &str,
+        mount_path: &str,
+    ) -> Result<Traced<SandboxInfo>, SdkError> {
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}/file_systems"));
+        let body = DetachFileSystemRequest {
+            mount_path: mount_path.to_string(),
+        };
+        let req = self
+            .client
+            .build_post_json_request(Method::DELETE, &uri, &body)?;
+        self.client.execute_json(req).await
+    }
+
+    pub async fn snapshot(
+        &self,
+        sandbox_id: &str,
+        snapshot_type: Option<SnapshotType>,
+    ) -> Result<Traced<CreateSnapshotResponse>, SdkError> {
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}/snapshot"));
+        let req = if snapshot_type.is_some() {
+            let body = CreateSnapshotRequest { snapshot_type };
+            self.client
+                .build_post_json_request(Method::POST, &uri, &body)?
+        } else {
+            // Preserve today's wire shape (no body) for callers that don't set a snapshot type.
+            self.client.build_empty_post_request(&uri)?
+        };
+        self.client.execute_json(req).await
+    }
+
+    pub async fn get_snapshot(&self, snapshot_id: &str) -> Result<Traced<SnapshotInfo>, SdkError> {
+        let uri = self.endpoint(&format!("snapshots/{snapshot_id}"));
+        let req = self.client.request(Method::GET, &uri).build()?;
+        self.client.execute_read_json(req).await
+    }
+
+    /// Every snapshot in the namespace, following the listing's cursor to its
+    /// end.
+    pub async fn list_snapshots(&self) -> Result<Traced<Vec<SnapshotInfo>>, SdkError> {
+        let uri = self.endpoint("snapshots");
+        self.list_all::<ListSnapshotsResponse>(&uri, MAX_LIST_PAGES)
+            .await
+    }
+
+    /// Every snapshot taken from `sandbox_id` (an id or a name), from the
+    /// sandbox's own listing rather than the whole namespace's.
+    pub async fn list_sandbox_snapshots(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Traced<Vec<SnapshotInfo>>, SdkError> {
+        let uri = self.endpoint(&format!("sandboxes/{sandbox_id}/snapshots"));
+        self.list_all::<ListSnapshotsResponse>(&uri, MAX_LIST_PAGES)
+            .await
+    }
+
+    pub async fn delete_snapshot(&self, snapshot_id: &str) -> Result<Traced<()>, SdkError> {
+        let uri = self.endpoint(&format!("snapshots/{snapshot_id}"));
+        let req = self.client.request(Method::DELETE, &uri).build()?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn create_pool(
+        &self,
+        request: &SandboxPoolRequest,
+    ) -> Result<Traced<CreateSandboxPoolResponse>, SdkError> {
+        self.create_pool_with_network(&CreateSandboxPoolRequest {
+            pool: request.clone(),
+            network: None,
+        })
+        .await
+    }
+
+    /// Creates a pool with an optional network policy for each container.
+    pub async fn create_pool_with_network(
+        &self,
+        request: &CreateSandboxPoolRequest,
+    ) -> Result<Traced<CreateSandboxPoolResponse>, SdkError> {
+        let uri = self.endpoint("sandbox-pools");
+        let req = self
+            .client
+            .build_post_json_request(Method::POST, &uri, request)?;
+        self.client.execute_json(req).await
+    }
+
+    pub async fn get_pool(&self, pool_id: &str) -> Result<Traced<SandboxPoolInfo>, SdkError> {
+        let uri = self.endpoint(&format!("sandbox-pools/{pool_id}"));
+        let req = self.client.request(Method::GET, &uri).build()?;
+        self.client.execute_read_json(req).await
+    }
+
+    pub async fn list_pools(&self) -> Result<Traced<Vec<SandboxPoolInfo>>, SdkError> {
+        let uri = self.endpoint("sandbox-pools");
+        let req = self.client.request(Method::GET, &uri).build()?;
+        Ok(self
+            .client
+            .execute_read_json::<ListSandboxPoolsResponse>(req)
+            .await?
+            .map(|r| r.pools))
+    }
+
+    /// Replace a pool configuration, keeping its current network policy.
+    /// Use [`Self::update_pool_with_network`] to replace the policy too.
+    pub async fn update_pool(
+        &self,
+        pool_id: &str,
+        request: &SandboxPoolRequest,
+    ) -> Result<Traced<SandboxPoolInfo>, SdkError> {
+        self.update_pool_with_network(
+            pool_id,
+            &UpdateSandboxPoolRequest {
+                pool: request.clone(),
+                network: NetworkPolicyUpdate::Keep,
+            },
+        )
+        .await
+    }
+
+    /// Replace a pool configuration, optionally changing its network policy.
+    ///
+    /// [`NetworkPolicyUpdate::Keep`] leaves the current policy in place;
+    /// [`NetworkPolicyUpdate::Clear`] removes it; [`NetworkPolicyUpdate::Set`]
+    /// replaces it. On a change the service recycles the pool's unclaimed warm
+    /// containers onto the new policy, while containers already claimed by
+    /// sandboxes keep the policy they booted with.
+    pub async fn update_pool_with_network(
+        &self,
+        pool_id: &str,
+        request: &UpdateSandboxPoolRequest,
+    ) -> Result<Traced<SandboxPoolInfo>, SdkError> {
+        let mut request = request.clone();
+        // Newer services keep the current policy when the field is absent, but
+        // older ones clear it, so resolve `Keep` into the current policy here.
+        // Sending the unchanged policy is a no-op for the service: the pool's
+        // boot config does not change, so no warm containers are recycled.
+        if request.network.is_keep()
+            && let Some(current) = self.get_pool(pool_id).await?.network_policy.clone()
+        {
+            request.network = NetworkPolicyUpdate::Set(current);
+        }
+
+        let uri = self.endpoint(&format!("sandbox-pools/{pool_id}"));
+        let req = self
+            .client
+            .build_post_json_request(Method::PUT, &uri, &request)?;
+        self.client.execute_json(req).await
+    }
+
+    pub async fn delete_pool(&self, pool_id: &str) -> Result<Traced<()>, SdkError> {
+        let uri = self.endpoint(&format!("sandbox-pools/{pool_id}"));
+        let req = self.client.request(Method::DELETE, &uri).build()?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+}
+
+/// A client for interacting with a running sandbox proxy (process/file/PTY APIs).
+#[derive(Clone)]
+pub struct SandboxProxyClient {
+    client: Client,
+    host_override: Option<String>,
+    routing_hint: Option<String>,
+    sandbox_id: Option<String>,
+}
+
+impl SandboxProxyClient {
+    pub fn new(client: Client, host_override: Option<String>) -> Self {
+        Self {
+            client,
+            host_override,
+            routing_hint: None,
+            sandbox_id: None,
+        }
+    }
+
+    pub fn with_routing_hint(mut self, hint: Option<String>) -> Self {
+        self.routing_hint = hint;
+        self
+    }
+
+    pub fn with_sandbox_id(mut self, id: Option<String>) -> Self {
+        self.sandbox_id = id;
+        self
+    }
+
+    pub fn http_client(&self) -> &Client {
+        &self.client
+    }
+
+    pub fn host_override(&self) -> Option<&str> {
+        self.host_override.as_deref()
+    }
+
+    pub fn sandbox_id(&self) -> Option<&str> {
+        self.sandbox_id.as_deref()
+    }
+
+    fn request(&self, method: Method, path: &str) -> reqwest_middleware::RequestBuilder {
+        let mut request_builder = self.client.request(method, path);
+        if let Some(host) = self.host_override.as_deref() {
+            request_builder = request_builder.header("Host", host);
+        }
+        if let Some(id) = self.sandbox_id.as_deref() {
+            request_builder = request_builder.header("X-Tensorlake-Sandbox-Id", id);
+        }
+        if let Some(hint) = self.routing_hint.as_deref() {
+            request_builder = request_builder.header("X-Tensorlake-Route-Hint", hint);
+        }
+        request_builder
+    }
+
+    pub async fn start_process(&self, payload: &Value) -> Result<Traced<ProcessInfo>, SdkError> {
+        // Validate a managed name up front (clear client-side error before the round-trip).
+        // The daemon re-validates as the final authority for any path that bypasses this.
+        if let Some(name) = payload.get("name").and_then(Value::as_str) {
+            validate_managed_name(name)?;
+        }
+        let req = self
+            .request(Method::POST, "/api/v1/processes")
+            .json(payload)
+            .build()?;
+        self.client.execute_json(req).await
+    }
+
+    pub async fn list_processes(&self) -> Result<Traced<Vec<ProcessInfo>>, SdkError> {
+        let req = self.request(Method::GET, "/api/v1/processes").build()?;
+        Ok(self
+            .client
+            .execute_read_json::<ListProcessesResponse>(req)
+            .await?
+            .map(|r| r.processes))
+    }
+
+    pub async fn get_process(
+        &self,
+        process: impl Into<ProcessRef>,
+    ) -> Result<Traced<ProcessInfo>, SdkError> {
+        let seg = process.into().to_path_segment();
+        let req = self
+            .request(Method::GET, &format!("/api/v1/processes/{seg}"))
+            .build()?;
+        self.client.execute_read_json(req).await
+    }
+
+    pub async fn kill_process(
+        &self,
+        process: impl Into<ProcessRef>,
+    ) -> Result<Traced<()>, SdkError> {
+        let seg = process.into().to_path_segment();
+        let req = self
+            .request(Method::DELETE, &format!("/api/v1/processes/{seg}"))
+            .build()?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn restart_process(
+        &self,
+        process: impl Into<ProcessRef>,
+    ) -> Result<Traced<ProcessInfo>, SdkError> {
+        let seg = process.into().to_path_segment();
+        let req = build_empty_post_request_from_builder(
+            self.request(Method::POST, &format!("/api/v1/processes/{seg}/restart")),
+        )?;
+        self.client.execute_json(req).await
+    }
+
+    pub async fn send_signal(
+        &self,
+        process: impl Into<ProcessRef>,
+        signal: i64,
+    ) -> Result<Traced<SendSignalResponse>, SdkError> {
+        let seg = process.into().to_path_segment();
+        let req = self
+            .request(Method::POST, &format!("/api/v1/processes/{seg}/signal"))
+            .json(&serde_json::json!({ "signal": signal }))
+            .build()?;
+        self.client.execute_json(req).await
+    }
+
+    pub async fn write_stdin(
+        &self,
+        process: impl Into<ProcessRef>,
+        data: Vec<u8>,
+    ) -> Result<Traced<()>, SdkError> {
+        let seg = process.into().to_path_segment();
+        let req = build_bytes_post_request_from_builder(
+            self.request(Method::POST, &format!("/api/v1/processes/{seg}/stdin")),
+            data,
+        )?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn close_stdin(
+        &self,
+        process: impl Into<ProcessRef>,
+    ) -> Result<Traced<()>, SdkError> {
+        let seg = process.into().to_path_segment();
+        let req = build_empty_post_request_from_builder(self.request(
+            Method::POST,
+            &format!("/api/v1/processes/{seg}/stdin/close"),
+        ))?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn get_stdout(
+        &self,
+        process: impl Into<ProcessRef>,
+    ) -> Result<Traced<OutputResponse>, SdkError> {
+        let seg = process.into().to_path_segment();
+        let req = self
+            .request(Method::GET, &format!("/api/v1/processes/{seg}/stdout"))
+            .build()?;
+        self.client.execute_json(req).await
+    }
+
+    pub async fn get_stderr(
+        &self,
+        process: impl Into<ProcessRef>,
+    ) -> Result<Traced<OutputResponse>, SdkError> {
+        let seg = process.into().to_path_segment();
+        let req = self
+            .request(Method::GET, &format!("/api/v1/processes/{seg}/stderr"))
+            .build()?;
+        self.client.execute_json(req).await
+    }
+
+    pub async fn get_output(
+        &self,
+        process: impl Into<ProcessRef>,
+    ) -> Result<Traced<OutputResponse>, SdkError> {
+        let seg = process.into().to_path_segment();
+        let req = self
+            .request(Method::GET, &format!("/api/v1/processes/{seg}/output"))
+            .build()?;
+        self.client.execute_json(req).await
+    }
+
+    pub async fn follow_stdout(
+        &self,
+        process: impl Into<ProcessRef>,
+    ) -> Result<Traced<Vec<OutputEvent>>, SdkError> {
+        let mut events = Vec::new();
+        let trace_id = self
+            .follow_stdout_streaming(process, |event| events.push(event))
+            .await?;
+        Ok(Traced::new(trace_id, events))
+    }
+
+    pub async fn follow_stderr(
+        &self,
+        process: impl Into<ProcessRef>,
+    ) -> Result<Traced<Vec<OutputEvent>>, SdkError> {
+        let mut events = Vec::new();
+        let trace_id = self
+            .follow_stderr_streaming(process, |event| events.push(event))
+            .await?;
+        Ok(Traced::new(trace_id, events))
+    }
+
+    pub async fn follow_output(
+        &self,
+        process: impl Into<ProcessRef>,
+    ) -> Result<Traced<Vec<OutputEvent>>, SdkError> {
+        let mut events = Vec::new();
+        let trace_id = self
+            .follow_output_streaming(process, |event| events.push(event))
+            .await?;
+        Ok(Traced::new(trace_id, events))
+    }
+
+    /// Stream stdout output events to `on_event` as they arrive, without
+    /// buffering. Returns the request `trace_id` once the upstream stream
+    /// closes. This is the streaming counterpart to [`follow_stdout`] used by
+    /// language bindings that surface a live event stream to the caller.
+    pub async fn follow_stdout_streaming(
+        &self,
+        process: impl Into<ProcessRef>,
+        mut on_event: impl FnMut(OutputEvent),
+    ) -> Result<String, SdkError> {
+        self.follow_stdout_streaming_async(process, |event| {
+            on_event(event);
+            std::future::ready(Ok(()))
+        })
+        .await
+    }
+
+    /// Await consumer capacity before reading the next event.
+    pub async fn follow_stdout_streaming_async<F>(
+        &self,
+        process: impl Into<ProcessRef>,
+        on_event: impl FnMut(OutputEvent) -> F,
+    ) -> Result<String, SdkError>
+    where
+        F: std::future::Future<Output = Result<(), SdkError>>,
+    {
+        let seg = process.into().to_path_segment();
+        self.follow_stream_cb(&format!("/api/v1/processes/{seg}/stdout/follow"), on_event)
+            .await
+    }
+
+    pub async fn follow_stderr_streaming(
+        &self,
+        process: impl Into<ProcessRef>,
+        mut on_event: impl FnMut(OutputEvent),
+    ) -> Result<String, SdkError> {
+        self.follow_stderr_streaming_async(process, |event| {
+            on_event(event);
+            std::future::ready(Ok(()))
+        })
+        .await
+    }
+
+    /// Await consumer capacity before reading the next event.
+    pub async fn follow_stderr_streaming_async<F>(
+        &self,
+        process: impl Into<ProcessRef>,
+        on_event: impl FnMut(OutputEvent) -> F,
+    ) -> Result<String, SdkError>
+    where
+        F: std::future::Future<Output = Result<(), SdkError>>,
+    {
+        let seg = process.into().to_path_segment();
+        self.follow_stream_cb(&format!("/api/v1/processes/{seg}/stderr/follow"), on_event)
+            .await
+    }
+
+    pub async fn follow_output_streaming(
+        &self,
+        process: impl Into<ProcessRef>,
+        mut on_event: impl FnMut(OutputEvent),
+    ) -> Result<String, SdkError> {
+        self.follow_output_streaming_async(process, |event| {
+            on_event(event);
+            std::future::ready(Ok(()))
+        })
+        .await
+    }
+
+    /// Await consumer capacity before reading the next event.
+    pub async fn follow_output_streaming_async<F>(
+        &self,
+        process: impl Into<ProcessRef>,
+        on_event: impl FnMut(OutputEvent) -> F,
+    ) -> Result<String, SdkError>
+    where
+        F: std::future::Future<Output = Result<(), SdkError>>,
+    {
+        let seg = process.into().to_path_segment();
+        self.follow_stream_cb(&format!("/api/v1/processes/{seg}/output/follow"), on_event)
+            .await
+    }
+
+    pub async fn run_process(
+        &self,
+        payload: &Value,
+    ) -> Result<Traced<Vec<RunProcessEvent>>, SdkError> {
+        let mut events = Vec::new();
+        let trace_id = self
+            .run_process_streaming(payload, |event| events.push(event))
+            .await?;
+        Ok(Traced::new(trace_id, events))
+    }
+
+    /// Start a process and stream its lifecycle events to `on_event` as they
+    /// arrive. Returns the request `trace_id` once the process exits and the
+    /// stream closes. This is the streaming counterpart to [`run_process`].
+    pub async fn run_process_streaming(
+        &self,
+        payload: &Value,
+        mut on_event: impl FnMut(RunProcessEvent),
+    ) -> Result<String, SdkError> {
+        self.run_process_streaming_async(payload, |event| {
+            on_event(event);
+            std::future::ready(Ok(()))
+        })
+        .await
+    }
+
+    /// Await consumer capacity before reading the next lifecycle event.
+    pub async fn run_process_streaming_async<F>(
+        &self,
+        payload: &Value,
+        mut on_event: impl FnMut(RunProcessEvent) -> F,
+    ) -> Result<String, SdkError>
+    where
+        F: std::future::Future<Output = Result<(), SdkError>>,
+    {
+        let path = "/api/v1/processes/run";
+        let req = self
+            .request(Method::POST, path)
+            .header(ACCEPT, "text/event-stream")
+            .json(payload)
+            .build()?;
+        let (response, idle_timeout) = self.client.execute_stream_traced(req).await?;
+        let trace_id = response.trace_id.clone();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !content_type.contains("text/event-stream") {
+            return Err(SdkError::ClientError(format!(
+                "expected text/event-stream response from {path}, got content-type: {content_type}"
+            )));
+        }
+        let stream =
+            event_stream(response.into_inner(), idle_timeout).filter_map(move |event| async move {
+                match event {
+                    Ok(msg) => {
+                        // The Exited variant has all-optional fields so it acts as a
+                        // catch-all for unrecognised JSON. Discard Exited{None, None}
+                        // — a real exit always has at least one of exit_code or signal.
+                        match serde_json::from_str::<RunProcessEvent>(&msg.data) {
+                            Ok(RunProcessEvent::Exited {
+                                exit_code: None,
+                                signal: None,
+                                ..
+                            }) => None,
+                            Ok(evt) => Some(Ok(evt)),
+                            Err(_) => None,
+                        }
+                    }
+                    Err(error) => Some(Err(error)),
+                }
+            });
+        futures::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            on_event(event?).await?;
+        }
+        Ok(trace_id)
+    }
+
+    async fn follow_stream_cb<F>(
+        &self,
+        path: &str,
+        mut on_event: impl FnMut(OutputEvent) -> F,
+    ) -> Result<String, SdkError>
+    where
+        F: std::future::Future<Output = Result<(), SdkError>>,
+    {
+        let req = self
+            .request(Method::GET, path)
+            .header(ACCEPT, "text/event-stream")
+            .build()?;
+        let (response, idle_timeout) = self.client.execute_stream_traced(req).await?;
+        let trace_id = response.trace_id.clone();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !content_type.contains("text/event-stream") {
+            return Err(SdkError::ClientError(format!(
+                "expected text/event-stream response from {path}, got content-type: {content_type}"
+            )));
+        }
+        let stream =
+            event_stream(response.into_inner(), idle_timeout).filter_map(move |event| async move {
+                match event {
+                    Ok(msg) => match serde_json::from_str::<OutputEvent>(&msg.data) {
+                        Ok(evt) => Some(Ok(evt)),
+                        Err(_) => None, // skip heartbeats / non-output events
+                    },
+                    Err(error) => Some(Err(error)),
+                }
+            });
+        futures::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            on_event(event?).await?;
+        }
+        Ok(trace_id)
+    }
+
+    pub async fn read_file(&self, path: &str) -> Result<Traced<Vec<u8>>, SdkError> {
+        let req = self
+            .request(Method::GET, "/api/v1/files")
+            .query(&[("path", path)])
+            .build()?;
+        let resp = self.client.execute_traced(req).await?;
+        let trace_id = resp.trace_id.clone();
+        let bytes = resp.into_inner().bytes().await?;
+        Ok(Traced::new(trace_id, bytes.to_vec()))
+    }
+
+    pub async fn write_file(&self, path: &str, content: Vec<u8>) -> Result<Traced<()>, SdkError> {
+        let req = self
+            .request(Method::PUT, "/api/v1/files")
+            .query(&[("path", path)])
+            .body(content)
+            .build()?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn upload_file(
+        &self,
+        path: &str,
+        local_path: impl AsRef<Path>,
+    ) -> Result<Traced<()>, SdkError> {
+        let file = File::open(local_path.as_ref()).await?;
+        let size = file.metadata().await?.len();
+        let stream = ReaderStream::new(file);
+        let req = self
+            .request(Method::PUT, "/api/v1/files")
+            .query(&[("path", path)])
+            .header(CONTENT_LENGTH, size)
+            .body(reqwest::Body::wrap_stream(stream))
+            .build()?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn upload_file_with_progress(
+        &self,
+        path: &str,
+        local_path: impl AsRef<Path>,
+        progress_tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    ) -> Result<Traced<()>, SdkError> {
+        let file = File::open(local_path.as_ref()).await?;
+        let size = file.metadata().await?.len();
+        let mut uploaded = 0_u64;
+        let stream = ReaderStream::new(file).map_ok(move |chunk| {
+            uploaded = uploaded.saturating_add(chunk.len() as u64);
+            let _ = progress_tx.send(uploaded);
+            chunk
+        });
+        let req = self
+            .request(Method::PUT, "/api/v1/files")
+            .query(&[("path", path)])
+            .header(CONTENT_LENGTH, size)
+            .body(reqwest::Body::wrap_stream(stream))
+            .build()?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn delete_file(&self, path: &str) -> Result<Traced<()>, SdkError> {
+        let req = self
+            .request(Method::DELETE, "/api/v1/files")
+            .query(&[("path", path)])
+            .build()?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn list_directory(
+        &self,
+        path: &str,
+    ) -> Result<Traced<ListDirectoryResponse>, SdkError> {
+        let req = self
+            .request(Method::GET, "/api/v1/files/list")
+            .query(&[("path", path)])
+            .build()?;
+        self.client.execute_read_json(req).await
+    }
+
+    pub async fn create_pty_session(&self, payload: &Value) -> Result<Traced<Value>, SdkError> {
+        let req = self
+            .request(Method::POST, "/api/v1/pty")
+            .json(payload)
+            .build()?;
+        self.client.execute_json(req).await
+    }
+
+    pub async fn delete_pty_session(&self, session_id: &str) -> Result<Traced<()>, SdkError> {
+        let req = self
+            .request(Method::DELETE, &format!("/api/v1/pty/{session_id}"))
+            .build()?;
+        Ok(self.client.execute_traced(req).await?.map(|_| ()))
+    }
+
+    pub async fn health(&self) -> Result<Traced<HealthResponse>, SdkError> {
+        let req = self.request(Method::GET, "/api/v1/health").build()?;
+        self.client.execute_read_json(req).await
+    }
+
+    pub async fn info(&self) -> Result<Traced<DaemonInfo>, SdkError> {
+        let req = self.request(Method::GET, "/api/v1/info").build()?;
+        self.client.execute_read_json(req).await
+    }
+
+    /// Ask the sandbox proxy to mint a builder-compatible blob signing spec.
+    ///
+    /// Used during the versioned-response rollout: platform-api now returns
+    /// `snapshotRelPath` instead of a pre-signed `upload` block, and the CLI
+    /// calls this endpoint to resolve the artifact rel-path into a concrete
+    /// upload spec. Parent snapshot downloads use the same endpoint with a
+    /// full blob URI. The response is a `serde_json::Value` because most
+    /// fields splice verbatim into the rootfs build spec consumed by the
+    /// in-sandbox builder.
+    pub async fn sign_blob(&self, request: &SignBlobRequest) -> Result<Traced<Value>, SdkError> {
+        let req = self
+            .request(Method::POST, "/api/v1/blob/sign")
+            .json(request)
+            .build()?;
+        self.client.execute_json(req).await
+    }
+}
+
+#[cfg(test)]
+mod process_ref_tests {
+    use super::{
+        FileSystemMount, ProcessRef, resolve_sandbox_proxy_target, sandbox_proxy_hostname,
+        sandbox_url_from_ingress_endpoint, select_sandbox_proxy_url, validate_managed_name,
+        validate_mount_owners, validate_mount_snapshot_pins,
+    };
+
+    #[test]
+    fn validate_managed_name_rules() {
+        // Only three rejections: empty, contains '/', and all-digits (reserved for PID).
+        let long_digits = "9".repeat(100);
+        for bad in ["", "123", "0", "a/b", "worker/api", &long_digits] {
+            assert!(
+                validate_managed_name(bad).is_err(),
+                "expected {bad:?} rejected"
+            );
+        }
+        // Permissive: spaces, punctuation, leading/trailing whitespace, and unicode are all
+        // allowed now (clients percent-encode the path segment).
+        for ok in [
+            "web",
+            "web1",
+            "1web",
+            "my-app_v.2",
+            "web 1",
+            " web ",
+            "a?b",
+            "a%b",
+            "a#b",
+            "café",
+        ] {
+            assert!(
+                validate_managed_name(ok).is_ok(),
+                "expected {ok:?} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn process_ref_path_segments() {
+        assert_eq!(ProcessRef::from(1234u64).to_path_segment(), "1234");
+        assert_eq!(ProcessRef::from(42i64).to_path_segment(), "42");
+        // A numeric string is treated as a pid; a name is percent-encoded.
+        assert_eq!(ProcessRef::from("1234").to_path_segment(), "1234");
+        assert!(matches!(ProcessRef::from("1234"), ProcessRef::Pid(1234)));
+        assert_eq!(ProcessRef::from("web").to_path_segment(), "web");
+        assert!(matches!(ProcessRef::from("web"), ProcessRef::Name(_)));
+        // Spaces and reserved characters in a name are percent-encoded into one segment.
+        assert_eq!(ProcessRef::from("web 1").to_path_segment(), "web%201");
+        assert_eq!(ProcessRef::from("a?b").to_path_segment(), "a%3Fb");
+    }
+
+    #[test]
+    fn select_proxy_url_prefers_server_sandbox_url() {
+        let selected = select_sandbox_proxy_url(
+            "https://api.tensorlake.ai",
+            "sbx-1",
+            Some("https://sbx-1.sandbox.gcp-use4.tensorlake.ai"),
+            Some("https://sandbox.us-east-1.aws.tensorlake.ai"),
+            Some("https://override.example.com"),
+        )
+        .unwrap();
+
+        assert_eq!(selected, "https://sbx-1.sandbox.gcp-use4.tensorlake.ai");
+    }
+
+    #[test]
+    fn select_proxy_url_uses_explicit_override_when_server_url_missing() {
+        let selected = select_sandbox_proxy_url(
+            "https://api.tensorlake.ai",
+            "sbx-1",
+            None,
+            Some("https://sandbox.gcp-use4.tensorlake.ai"),
+            Some("https://override.example.com"),
+        )
+        .unwrap();
+
+        assert_eq!(selected, "https://override.example.com");
+    }
+
+    #[test]
+    fn select_proxy_url_errors_without_server_url_or_explicit_override() {
+        let error = select_sandbox_proxy_url(
+            "https://api.tensorlake.ai",
+            "sbx-1",
+            None,
+            Some("https://sandbox.gcp-use4.tensorlake.ai"),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("server response did not include sandbox_url"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn ingress_endpoint_url_builder_preserves_custom_port() {
+        let selected = sandbox_url_from_ingress_endpoint(
+            "https://sandbox.gcp-use4.tensorlake.ai:9443",
+            "sbx-1",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected,
+            "https://sbx-1.sandbox.gcp-use4.tensorlake.ai:9443"
+        );
+    }
+
+    #[test]
+    fn proxy_target_preserves_server_sandbox_host() {
+        let target =
+            resolve_sandbox_proxy_target("https://sbx-1.sandbox.gcp-use4.tensorlake.ai", "sbx-1")
+                .unwrap();
+
+        assert_eq!(
+            target.base_url,
+            "https://sbx-1.sandbox.gcp-use4.tensorlake.ai"
+        );
+        assert_eq!(target.host_override, None);
+        assert_eq!(target.sandbox_id_header.as_deref(), Some("sbx-1"));
+    }
+
+    #[test]
+    fn sandbox_proxy_hostname_uses_server_sandbox_url_host() {
+        let hostname =
+            sandbox_proxy_hostname("https://sbx-1.sandbox.gcp-use4.tensorlake.ai").unwrap();
+
+        assert_eq!(hostname, "sbx-1.sandbox.gcp-use4.tensorlake.ai");
+    }
+
+    #[test]
+    fn snapshot_pin_without_read_only_is_a_client_error() {
+        let pinned_writable = FileSystemMount {
+            file_system_id: "skills".to_string(),
+            mount_path: "/mnt/skills".to_string(),
+            read_only: false,
+            prefetch: false,
+            snapshot_id: Some("0abc123def".to_string()),
+            owner: None,
+        };
+        let error = validate_mount_snapshot_pins(std::slice::from_ref(&pinned_writable))
+            .expect_err("a writable snapshot pin must be rejected client-side");
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot-pinned mounts are read-only"),
+            "unexpected error: {error}"
+        );
+
+        let pinned_read_only = FileSystemMount {
+            read_only: true,
+            ..pinned_writable.clone()
+        };
+        let unpinned = FileSystemMount {
+            snapshot_id: None,
+            ..pinned_writable
+        };
+        validate_mount_snapshot_pins(&[pinned_read_only, unpinned])
+            .expect("read-only pins and unpinned mounts are valid");
+    }
+
+    #[test]
+    fn malformed_mount_owner_is_a_client_error() {
+        let mount = |owner: Option<&str>| FileSystemMount {
+            file_system_id: "skills".to_string(),
+            mount_path: "/mnt/skills".to_string(),
+            read_only: false,
+            prefetch: false,
+            snapshot_id: None,
+            owner: owner.map(str::to_string),
+        };
+
+        for good in [None, Some("agent"), Some("1001:1001"), Some("agent:wheel")] {
+            validate_mount_owners(std::slice::from_ref(&mount(good)))
+                .expect("well-formed owners are valid");
+        }
+
+        for bad in ["", ":", "agent:", "a:b:c", "with space", "4294967296"] {
+            let error = validate_mount_owners(std::slice::from_ref(&mount(Some(bad))))
+                .expect_err("malformed owner specs must be rejected client-side");
+            assert!(
+                error.to_string().contains("invalid owner"),
+                "unexpected error for {bad:?}: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::{ListSnapshotsResponse, SandboxesClient};
+    use crate::{ClientBuilder, error::SdkError};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Answer one GET per connection with each of `bodies` in turn.
+    async fn serve(listener: TcpListener, bodies: Vec<String>) {
+        for body in bodies {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buf).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_stops_at_its_page_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let bodies = (0..3)
+            .map(|page| format!(r#"{{"snapshots":[],"cursor":"page-{page}"}}"#))
+            .collect();
+        let server = tokio::spawn(serve(listener, bodies));
+        let client = ClientBuilder::new(&format!("http://{address}"))
+            .build()
+            .expect("client");
+        let sandboxes = SandboxesClient::new(client, "default", false);
+        let error = sandboxes
+            .list_all::<ListSnapshotsResponse>("/snapshots", 3)
+            .await
+            .expect_err("a listing past its cap must fail");
+        assert!(
+            matches!(&error, SdkError::ClientError(message) if message.contains("did not end within 3 pages")),
+            "{error:?}"
+        );
+        server.await.expect("server");
+    }
+}
